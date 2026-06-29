@@ -12,8 +12,8 @@ constructing the LLMUsageRecorder and invoking the LLM):
         return _budget_rejection_response(decision)
     # ...continue normal LLM path
 
-Reads from the `llm_usage_events_with_cost` view. A 30-second in-process cache
-keeps the check off the response path. The cache means a hot caller can
+Reads the current daily total from the private hosted account authority. A
+30-second in-process cache keeps the check off the response path. The cache means a hot caller can
 technically over-spend by up to 30s of LLM calls before being cut off; that is
 acceptable for v1.
 
@@ -81,31 +81,12 @@ def _fetch_anonymous_cost_today(ip_hash: str) -> Decimal:
     Returns 0 on Supabase unavailable / query failure - we fail open rather than
     blocking traffic on an analytics outage.
     """
-    from .logging_analytics import get_supabase, logger
+    from .hosted_control_plane import get_anonymous_usage_cost
+    from .logging_analytics import logger
 
-    client = get_supabase()
-    if client is None:
-        return Decimal("0")
     try:
-        result = (
-            client.client.table("llm_usage_events_with_cost")
-            .select("cost_usd")
-            .eq("caller_kind", "anonymous")
-            .eq("ip_hash", ip_hash)
-            .gte("created_at", _utc_today_start_iso())
-            .execute()
-        )
-        rows = result.data or []
-        total = Decimal("0")
-        for row in rows:
-            value = row.get("cost_usd")
-            if value is None:
-                continue
-            try:
-                total += Decimal(str(value))
-            except InvalidOperation:
-                continue
-        return total
+        value = get_anonymous_usage_cost(ip_hash, _utc_today_start_iso())
+        return Decimal(value) if value is not None else Decimal("0")
     except Exception as exc:
         logger.warning("anonymous budget fetch failed ip_hash=%s: %s", ip_hash, exc)
         return Decimal("0")

@@ -132,6 +132,21 @@ def load_or_create_ops_watch(*, cache, session_id: str, body: dict, allowed_feed
     requested_watch_id = str(body.get("watch_id") or "").strip() or None
     existing = _watch_from_cache(cache, requested_watch_id)
     if isinstance(existing, dict):
+        requested_feeds = _requested_ops_feeds(body)
+        if requested_feeds:
+            existing["active_feeds"] = [
+                feed for feed in requested_feeds if feed in allowed_feeds
+            ]
+        else:
+            active_feeds = [
+                feed
+                for feed in _normalize_feed_names(existing.get("active_feeds") or [])
+                if feed in allowed_feeds
+            ]
+            # Heal watches created before account/default feeds were available.
+            existing["active_feeds"] = active_feeds or list(allowed_feeds)
+        if cache is not None and isinstance(getattr(cache, "map_state", None), dict):
+            cache.map_state["ops_watch"] = existing
         return existing
     watch = _build_default_watch(session_id=session_id, body=body, allowed_feeds=allowed_feeds)
     if cache is not None and isinstance(getattr(cache, "map_state", None), dict):

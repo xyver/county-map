@@ -5,7 +5,7 @@ classification, the LLM call site(s) call .record(response) after each
 messages.create(), and the route calls .flush() in a finally block to emit one
 llm_usage_events row per user query.
 
-Cost is computed in the llm_usage_events_with_cost view, not here.
+Cost and account settlement are computed by the private hosted authority.
 
 Caller classification:
 - qa_suite      explicit in-process QA override
@@ -113,7 +113,7 @@ _PROFILE_CACHE_LOCK = threading.Lock()
 
 
 def _get_cached_profile(user_id: str) -> Optional[dict]:
-    """Read-through cache around supabase_client.get_profile.
+    """Read-through cache around the private hosted account context.
 
     Avoids hitting Supabase on every chat call. 5-minute TTL is fine because
     plan_id changes are rare and the worst case (slightly stale tier) is harmless
@@ -129,12 +129,10 @@ def _get_cached_profile(user_id: str) -> Optional[dict]:
 
     profile: Optional[dict] = None
     try:
-        from supabase_client import get_supabase_client
-        client = get_supabase_client()
-        if client:
-            profile = client.get_profile(user_id)
+        from mapmover.hosted_control_plane import get_account_context
+        profile = get_account_context(user_id)
     except Exception as exc:
-        logger.warning("llm_usage profile fetch failed user=%s: %s", user_id, exc)
+        logger.warning("llm_usage account context failed user=%s: %s", user_id, exc)
         profile = None
 
     with _PROFILE_CACHE_LOCK:

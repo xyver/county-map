@@ -915,14 +915,26 @@ def _find_containing_country_with_fallback(country_df, lon: float, lat: float):
     if candidates.empty:
         return None
 
+    point_bbox = (lon, lat, lon, lat)
     for _, row in candidates.iterrows():
         iso3 = str(row.get("loc_id") or "").strip()
         if not iso3:
             continue
         admin0_df = load_country_parquet(iso3, admin_level=0)
-        admin0_match = _find_containing_row(admin0_df, lon, lat)
-        if admin0_match is not None:
-            return admin0_match
+        if _find_containing_row(admin0_df, lon, lat) is not None:
+            return row
+        for admin_level in (1, 2):
+            level_df = load_country_parquet_viewport(
+                iso3,
+                admin_level,
+                point_bbox,
+            )
+            if level_df is None or level_df.empty:
+                level_df = load_country_parquet(iso3, admin_level=admin_level)
+            if _find_containing_row(level_df, lon, lat) is not None:
+                # Return the country row. The lower-level match only confirms
+                # containment when the simplified shared coastline has a gap.
+                return row
     return None
 
 

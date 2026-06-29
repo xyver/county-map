@@ -38,6 +38,16 @@ const SOURCE_TO_OVERLAY = {
   drought_events: 'drought'
 };
 
+const DISASTER_PRESET_SOURCE_PREFERENCES = {
+  earthquakes: 'earthquakes_events',
+  hurricanes: 'hurricanes',
+  volcanoes: 'volcanoes_events',
+  wildfires: 'global_fire_atlas',
+  tsunamis: 'tsunamis_events',
+  tornadoes: 'tornadoes',
+  floods: 'floods'
+};
+
 function getCurrentUtcYear() {
   return new Date().getUTCFullYear();
 }
@@ -230,7 +240,8 @@ function buildPresetActionFromPackDefaults(packIds, fallbackSummary = '') {
   const actions = [];
   const loadedPackIds = [];
   for (const packId of packIds) {
-    const action = buildPackDefaultLoadAction(packId);
+    const action = buildPackDefaultLoadAction(packId)
+      || buildDisasterPresetFallbackAction(packId);
     if (!action) {
       continue;
     }
@@ -246,6 +257,43 @@ function buildPresetActionFromPackDefaults(packIds, fallbackSummary = '') {
     summary: fallbackSummary,
     _resolvedPackIds: loadedPackIds,
     _requestedPackCount: Array.isArray(packIds) ? packIds.length : loadedPackIds.length
+  };
+}
+
+function buildDisasterPresetFallbackAction(packId) {
+  const normalizedPackId = String(packId || '').trim();
+  const preferredSourceId = DISASTER_PRESET_SOURCE_PREFERENCES[normalizedPackId];
+  const preferredEntry = preferredSourceId
+    ? getOverlayCatalogEntryBySourceId(preferredSourceId)
+    : null;
+  const sourceId = preferredEntry
+    ? preferredSourceId
+    : resolveEventSourceId({ packId: normalizedPackId });
+  if (!sourceId) return null;
+
+  const endYear = getCurrentUtcYear();
+  return {
+    type: 'source_default_load',
+    sourceId,
+    packId: normalizedPackId,
+    label: normalizedPackId,
+    loadAction: {
+      type: 'confirmed_order',
+      order: {
+        items: [{
+          pack_id: normalizedPackId,
+          source_id: sourceId,
+          mode: 'events',
+          year_start: endYear - 9,
+          year_end: endYear
+        }],
+        summary: `Loading 10 years of ${normalizedPackId.replace(/_/g, ' ')}`
+      },
+      entity: {
+        sourceId,
+        packId: normalizedPackId
+      }
+    }
   };
 }
 

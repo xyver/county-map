@@ -31,7 +31,7 @@ from mapmover.duckdb_helpers import (
 from mapmover.geometry_handlers import get_selection_geometries
 from mapmover.session_cache import session_manager
 from mapmover.source_time_contract import build_metric_year_ranges
-from supabase_client import SupabaseClient
+from mapmover.hosted_control_plane import get_saved_corpus
 
 
 RESEARCH_LIVE_SOURCE_ROW_THRESHOLD = 250_000
@@ -119,18 +119,8 @@ def _build_saved_corpus_summary(corpus_row: dict | None) -> dict | None:
 
 
 def _load_saved_corpus_for_user(user_id: str, corpus_id: str) -> dict | None:
-    client = SupabaseClient().client
-    result = (
-        client
-        .table("research_corpora")
-        .select("id, name, description, updated_at, research_corpus_items(item_type, item_id, position)")
-        .eq("user_id", user_id)
-        .eq("id", corpus_id)
-        .limit(1)
-        .execute()
-    )
-    rows = result.data or []
-    return _build_saved_corpus_summary(rows[0]) if rows else None
+    row = get_saved_corpus(user_id, corpus_id)
+    return _build_saved_corpus_summary(row) if row else None
 
 
 def _saved_corpus_request_key(corpus_id: str, source_id: str) -> str:

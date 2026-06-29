@@ -78,12 +78,11 @@ def _admin_catalog_refresh_forbidden_response(req: Request) -> Response | None:
         )
         return msgpack_error("Unauthorized", 401)
 
-    service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-    if service_key:
+    from mapmover.hosted_control_plane import control_plane_enabled, get_account_context
+
+    if control_plane_enabled():
         try:
-            from supabase_client import SupabaseClient
-            supa = SupabaseClient()
-            context = supa.get_user_entitlement_context(auth_user.get("id"))
+            context = get_account_context(auth_user.get("id"))
             if not context or context.get("error"):
                 logger.warning(
                     "Denied admin runtime action: entitlement lookup empty user_id=%s",
@@ -395,8 +394,8 @@ def _require_admin(req: Request):
     """
     Require a verified admin/master user for hosted runtime/admin operations.
 
-    For now we fail closed when the service-role key is absent so the hosted
-    surface cannot silently fall back to permissive local/dev behavior.
+    Hosted requests fail closed when the private control plane is unavailable
+    so the surface cannot silently fall back to permissive local/dev behavior.
     """
     deployment = str(os.getenv("DEPLOYMENT", "")).strip().lower()
     client_host = ((req.client.host if req.client else "") or "").strip().lower()
@@ -412,20 +411,18 @@ def _require_admin(req: Request):
         )
         return None, _admin_error(req, "Unauthorized", 401)
 
-    service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-    if not service_key:
+    from mapmover.hosted_control_plane import control_plane_enabled, get_account_context
+
+    if not control_plane_enabled():
         logger.warning(
-            "Denied hosted admin request: service key missing path=%s user_id=%s",
+            "Denied hosted admin request: control plane unavailable path=%s user_id=%s",
             req.url.path,
             auth_user.get("id"),
         )
         return None, _admin_error(req, "Admin operations unavailable", 403)
 
     try:
-        from supabase_client import SupabaseClient
-
-        supa = SupabaseClient()
-        context = supa.get_user_entitlement_context(auth_user.get("id"))
+        context = get_account_context(auth_user.get("id"))
     except Exception as exc:
         logger.warning(f"Admin entitlement check failed: {exc}")
         return None, _admin_error(req, "Entitlement check failed", 500)
@@ -1666,18 +1663,9 @@ async def submit_feedback(request: Request):
     else:
         source = "local"
 
-    try:
-        from supabase_client import get_supabase_client
-        sb = get_supabase_client()
-        if sb:
-            row = {"message": message, "source": source}
-            if user_id:
-                row["user_id"] = user_id
-            sb.client.table("feedback").insert(row).execute()
-        else:
-            logger.warning("Feedback received but Supabase not configured: %s", message[:80])
-    except Exception as exc:
-        logger.error("Failed to save feedback: %s", exc)
+    from mapmover.hosted_control_plane import submit_feedback
+    if not submit_feedback(message, source, user_id):
+        logger.error("Failed to save feedback through hosted control plane")
         return msgpack_error("Could not save feedback right now", 500)
 
     return msgpack_response({"ok": True})
@@ -1791,33 +1779,36 @@ def _get_entitled_packs(req: Request):
     Return the set of pack_ids this request is entitled to, or None for full bypass.
 
     None  -> full bypass: all catalog sources returned, including those without pack_id.
-             Applies to: master plan, is_admin=True, or no service key (dev/self-host).
+             Applies to: master plan, is_admin=True, or no hosted control plane (dev/self-host).
     set() -> anonymous or entitlement lookup failed: geometry_global only.
-    {..}  -> authenticated user: their entitled pack_ids from Supabase.
+    {..}  -> authenticated user: pack ids returned by the hosted account authority.
 
     Plan tiers:
       master      -> None (owner, sees everything including untagged/unreleased sources)
       is_admin    -> None (admin flag on any plan, same full bypass)
-      enterprise  -> entitled packs from pack_entitlements
-      pro         -> entitled packs from pack_entitlements
-      member      -> entitled packs from pack_entitlements
-      free        -> entitled packs from pack_entitlements (usually geometry_global only)
+      enterprise  -> packs returned by the hosted account authority
+      pro         -> packs returned by the hosted account authority
+      member      -> packs returned by the hosted account authority
+      free        -> hosted free-pack context (usually geometry_global only)
       anonymous   -> empty set
     """
+    deployment = str(os.getenv("DEPLOYMENT", "")).strip().lower()
+    if deployment == "local":
+        return None
+
     auth_user = get_authenticated_user(req)
     if not auth_user:
         return set()
 
-    service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-    if not service_key:
+    from mapmover.hosted_control_plane import control_plane_enabled, get_account_context
+
+    if not control_plane_enabled():
         # Dev / self-host mode: no entitlement enforcement
         return None
 
     user_id = auth_user.get("id")
     try:
-        from supabase_client import SupabaseClient
-        supa = SupabaseClient()
-        context = supa.get_user_entitlement_context(user_id)
+        context = get_account_context(user_id)
         if context and not context.get("error"):
             # Master plan or admin flag: full bypass, no pack_id filtering at all
             if context.get("plan_id") == "master" or context.get("is_admin"):
@@ -2038,7 +2029,7 @@ async def get_catalog_overlays(req: Request):
     all_sources = catalog.get("sources", [])
 
     if entitled is None:
-        # No service key - dev/self-host mode, return everything
+        # No hosted control plane - dev/self-host mode, return everything
         filtered_sources = all_sources
     else:
         # Filter to entitled packs; sources with no pack_id are excluded
@@ -3975,8 +3966,8 @@ async def get_auth_me(req: Request):
     Return the current user's identity and plan info.
 
     - Unauthenticated: returns guest defaults
-    - Authenticated without service key: returns basic identity from token
-    - Authenticated with service key: returns full profile and plan from Supabase
+    - Authenticated without a hosted control plane: basic identity from token
+    - Authenticated with a hosted control plane: account and entitlement context
     """
     auth_user = get_authenticated_user(req)
 
@@ -3991,13 +3982,12 @@ async def get_auth_me(req: Request):
     user_id = auth_user.get("id")
     email = auth_user.get("email")
 
-    # Try to load full profile via service key
-    service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-    if service_key:
+    # Try to load account context from the private hosted authority.
+    from mapmover.hosted_control_plane import control_plane_enabled, get_account_context
+
+    if control_plane_enabled():
         try:
-            from supabase_client import SupabaseClient
-            supa = SupabaseClient()
-            context = supa.get_user_entitlement_context(user_id)
+            context = get_account_context(user_id)
             metadata = auth_user.get("user_metadata") if isinstance(auth_user.get("user_metadata"), dict) else {}
             ops_feeds = metadata.get("ops_feeds") if isinstance(metadata.get("ops_feeds"), list) else []
             if context and not context.get("error"):

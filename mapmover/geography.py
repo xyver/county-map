@@ -160,13 +160,13 @@ def get_fallback_coordinates(country_code, log_missing=True):
             # coords is [lon, lat] format (GeoJSON standard)
             return (coords[1], coords[0])  # Return as (lat, lon)
 
-    # 3. Not found anywhere - log to Supabase if enabled
+    # 3. Not found anywhere - log to the hosted event sink if enabled
     if log_missing:
         try:
-            from supabase_client import get_supabase_client
-            supabase = get_supabase_client()
-            if supabase:
-                supabase.log_data_quality_issue(
+            from mapmover.hosted_control_plane import get_hosted_event_sink
+            event_sink = get_hosted_event_sink()
+            if event_sink:
+                event_sink.log_data_quality_issue(
                     issue_type="missing_geometry",
                     name=country_code,
                     metadata={"source": "get_fallback_coordinates"}

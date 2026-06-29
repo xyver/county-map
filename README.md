@@ -256,8 +256,8 @@ SUPABASE_URL=...
 SUPABASE_ANON_KEY=...
 ```
 
-Keep service-role keys server-side only. They are not needed for ordinary local
-evaluation.
+Do not configure a Supabase service-role key in the public runtime. Hosted
+account authority is provided by the separately deployed private control plane.
 
 ### 3. Run the app
 
@@ -372,7 +372,7 @@ Important files and folders:
 - `mapmover/` - runtime logic, routes, path helpers, DuckDB helpers
 - `static/` - frontend app modules and styles
 - `templates/` - app HTML shell
-- `supabase_client.py` - auth/control-plane integration
+- `mapmover/hosted_control_plane.py` - narrow adapter to optional hosted account and telemetry services
 - `docs/` - local documentation for schemas, runtime notes, and reference material
 
 ## Documentation In This Repo

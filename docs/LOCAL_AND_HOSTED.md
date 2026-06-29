@@ -125,9 +125,9 @@ Usually leave these unset unless you explicitly want hosted/account features:
 - `SUPABASE_ANON_KEY`
 
 Without Supabase config, the app stays in local/self-host mode and `/settings`
-becomes a local setup page instead of a hosted account redirect. Keep
-service-role keys server-side only; they are not needed for ordinary local
-evaluation.
+becomes a local setup page instead of a hosted account redirect. Never
+configure a Supabase service-role key in the public runtime; hosted account
+authority belongs to the private control plane.
 
 ## Related Docs
 

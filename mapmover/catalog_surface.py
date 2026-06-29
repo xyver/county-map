@@ -43,18 +43,16 @@ def request_can_use_wip_catalog(request, auth_user: dict | None) -> bool:
     if not auth_user:
         return False
 
-    service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-    if not service_key:
+    from mapmover.hosted_control_plane import control_plane_enabled, get_account_context
+
+    if not control_plane_enabled():
         deployment = str(os.getenv("DEPLOYMENT", "")).strip().lower()
         client = getattr(request, "client", None)
         client_host = getattr(client, "host", "") if client else ""
         return deployment == "local" and _is_loopback_host(client_host)
 
     try:
-        from supabase_client import SupabaseClient
-
-        supa = SupabaseClient()
-        context = supa.get_user_entitlement_context(auth_user.get("id"))
+        context = get_account_context(auth_user.get("id"))
         if not context or context.get("error"):
             return False
         return context.get("plan_id") == "master" or bool(context.get("is_admin"))
