@@ -3677,6 +3677,8 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
     query_layout_ids: set[str] = set()
     query_metadata_columns = [
         "loc_id", "parent_id", "admin_level", "name",
+        "source_id", "source_system", "source_vintage", "geometry_source",
+        "iso_a3", "has_polygon", "centroid_lon", "centroid_lat",
         "bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat",
     ]
     by_iso3: dict[str, list[str]] = {}

@@ -110,3 +110,75 @@ def test_exact_id_load_opens_only_shallow_and_requested_admin1_shards() -> None:
         "USA-SD-019-967600-1-023",
         "USA-CA-037-001-1-001",
     ]
+
+
+def test_route_index_handles_ids_whose_hyphens_do_not_encode_depth() -> None:
+    opened_paths = []
+
+    class Result:
+        def __init__(self, frame=None, rows=None):
+            self.frame = frame
+            self.rows = rows or []
+
+        def fetchdf(self):
+            return self.frame
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def execute(self, _sql, parameters=None):
+            path = parameters[0]
+            opened_paths.append(path)
+            if str(path).endswith("loc_id_routes.parquet"):
+                return Result(rows=[("DEU-GEM-091620000000", 5, "DEU-LAN-09")])
+            return Result(frame=pd.DataFrame({
+                "loc_id": ["DEU-GEM-091620000000"], "name": ["Muenchen"],
+            }))
+
+        def close(self):
+            pass
+
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "is_cloud_mode", return_value=True),
+        patch.object(admin_spine_query, "path_to_uri", side_effect=lambda path: path.as_posix()),
+        patch.object(admin_spine_query, "_layout_manifest", return_value={
+            "route_index": {"path": "loc_id_routes.parquet"},
+        }),
+        patch.object(admin_spine_query, "_connection", side_effect=lambda: Connection()),
+    ):
+        result = admin_spine_query.load_rows_by_loc_ids(
+            "DEU", ["DEU-GEM-091620000000"], columns=["name"],
+        )
+
+    assert opened_paths == [
+        "layout/loc_id_routes.parquet",
+        "layout/deep/DEU-LAN-09.parquet",
+    ]
+    assert result["loc_id"].tolist() == ["DEU-GEM-091620000000"]
+
+
+def test_modern_layout_fails_closed_when_route_index_is_unreadable() -> None:
+    class Connection:
+        def execute(self, _sql, parameters=None):
+            raise OSError("route index unavailable")
+
+        def close(self):
+            pass
+
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "is_cloud_mode", return_value=True),
+        patch.object(admin_spine_query, "_layout_manifest", return_value={
+            "route_index": {"path": "loc_id_routes.parquet"},
+        }),
+        patch.object(admin_spine_query, "_connection", return_value=Connection()),
+    ):
+        result = admin_spine_query.load_rows_by_loc_ids(
+            "DEU", ["DEU-GEM-091620000000"], columns=["name"],
+        )
+
+    assert result.empty

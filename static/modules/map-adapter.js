@@ -68,6 +68,10 @@ export const MapAdapter = {
   mapClickHandlerBound: false,
   canvasPointInspectorBound: false,
   pointResolveRequestToken: 0,
+  pointAddressSearchProvider: null,
+  pointAddressSearchResults: [],
+  pointAddressSearchRequestToken: 0,
+  pointAddressSearchDebounceTimer: null,
   featurePopupClickVersion: 0,
   featurePopupClickAt: 0,
   pendingPointInspectorTimer: null,
@@ -109,6 +113,8 @@ export const MapAdapter = {
     this.popup.on('close', () => {
       // Only unlock if this is a real close (user clicked X), not a re-show
       if (!this.isShowingPopup) {
+        clearTimeout(this.pointAddressSearchDebounceTimer);
+        this.pointAddressSearchRequestToken += 1;
         this.popupLocked = false;
         this.clearPopupFocusOverride('popup-close');
         this.resetVisualFocus();
@@ -1501,6 +1507,108 @@ export const MapAdapter = {
     `;
   },
 
+  /**
+   * Register an address-search provider for the point inspector.
+   *
+   * Provider contract:
+   *   search(query, context) -> [{ label, lat?, lng?, ...providerFields }]
+   *   resolve(candidate) -> { label?, lat, lng } (optional when search results
+   *   already contain coordinates)
+   *
+   * context includes the clicked point and current viewport. Providers should
+   * use them as ranking hints, not as geographic restrictions.
+   */
+  setPointAddressSearchProvider(provider = null) {
+    if (provider !== null && typeof provider?.search !== 'function') {
+      throw new TypeError('Point address search provider must expose search(query).');
+    }
+    this.pointAddressSearchProvider = provider;
+    this.pointAddressSearchResults = [];
+  },
+
+  getPointAddressSearchContext(lng, lat) {
+    const bounds = this.map?.getBounds?.();
+    const center = this.map?.getCenter?.();
+    const viewport = bounds ? {
+      north: Number(bounds.getNorth()),
+      east: Number(bounds.getEast()),
+      south: Number(bounds.getSouth()),
+      west: Number(bounds.getWest())
+    } : null;
+    const viewportCenter = center ? {
+      lat: Number(center.lat),
+      lng: Number(center.lng)
+    } : null;
+    return {
+      origin: { lat, lng },
+      viewport,
+      viewportCenter,
+      zoom: Number(this.map?.getZoom?.())
+    };
+  },
+
+  buildPointAddressSearchPopupHtml(lng, lat, options = {}) {
+    const providerConnected = Boolean(this.pointAddressSearchProvider);
+    const query = String(options.query || '');
+    const results = Array.isArray(options.results) ? options.results : [];
+    const statusHtml = options.statusHtml || (providerConnected
+      ? 'Enter an address to move the map and resolve its loc_id.'
+      : 'Address search is being connected. You can still look up a point by clicking the map.');
+    const resultHtml = results.length
+      ? `<div class="blank-map-popup-address-results" role="listbox" aria-label="Address suggestions">
+          ${results.map((candidate, index) => `
+            <button
+              type="button"
+              class="blank-map-popup-address-result"
+              data-action="select-point-address"
+              data-result-index="${index}"
+              role="option"
+            >${this._escapePopupHtml(candidate?.label || candidate?.address || 'Address result')}</button>
+          `).join('')}
+        </div>`
+      : '';
+
+    return `
+      <div
+        class="blank-map-popup blank-map-popup--address"
+        data-popup-kind="point-address-search"
+        data-origin-lng="${lng}"
+        data-origin-lat="${lat}"
+      >
+        <div class="blank-map-popup-header">
+          <div class="blank-map-popup-title">Find an address</div>
+          <div class="blank-map-popup-subtitle">Point lookup</div>
+        </div>
+        <form class="blank-map-popup-address-form" data-role="point-address-search-form">
+          <label class="blank-map-popup-address-label" for="point-address-search-input">Street address or place</label>
+          <input
+            id="point-address-search-input"
+            class="blank-map-popup-address-input"
+            type="search"
+            name="address"
+            value="${this._escapePopupHtml(query)}"
+            placeholder="Enter an address"
+            autocomplete="street-address"
+            spellcheck="false"
+            data-role="point-address-search-input"
+          />
+          <button
+            type="submit"
+            class="popup-btn btn-details blank-map-popup-button"
+            ${providerConnected && !options.loading ? '' : 'disabled'}
+          >${options.loading ? 'Searching...' : 'Find address'}</button>
+        </form>
+        ${resultHtml}
+        <div class="blank-map-popup-address-status" data-role="point-address-search-status">${statusHtml}</div>
+        <button
+          type="button"
+          class="blank-map-popup-back-button"
+          data-action="close-point-address-search"
+        >Back to coordinates</button>
+      </div>
+    `;
+  },
+
   buildPointInspectorPopupHtml(lng, lat, options = {}) {
     const statusHtml = options.statusHtml || '';
     const buttonLabel = options.loading ? 'Resolving...' : 'Get loc_id';
@@ -1516,6 +1624,13 @@ export const MapAdapter = {
             data-lng="${lng}"
             data-lat="${lat}"${buttonDisabled}
           >${buttonLabel}</button>
+          <button
+            type="button"
+            class="popup-btn blank-map-popup-button blank-map-popup-address-button"
+            data-action="open-point-address-search"
+            data-lng="${lng}"
+            data-lat="${lat}"${buttonDisabled}
+          >Enter address</button>
         </div>
       `
       : '';
@@ -1558,6 +1673,8 @@ export const MapAdapter = {
     const lat = Number(lngLat.lat);
     if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
 
+    clearTimeout(this.pointAddressSearchDebounceTimer);
+    this.pointAddressSearchRequestToken += 1;
     this.lockedPopupLocationInfo = null;
     this.selectedPopupContext = null;
     this.clearPopupFocusOverride('point-inspector-popup');
@@ -1571,6 +1688,101 @@ export const MapAdapter = {
       )
     );
     this.setupPopupTabHandlers?.();
+  },
+
+  showPointAddressSearchPopup(lng, lat, options = {}) {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+    this.popupLocked = true;
+    this.showPopup(
+      [lng, lat],
+      this.buildPointAddressSearchPopupHtml(lng, lat, options)
+    );
+    this.setupPopupTabHandlers?.();
+    const input = this.popup.getElement()?.querySelector('[data-role="point-address-search-input"]');
+    input?.focus();
+  },
+
+  async searchPointAddresses(form) {
+    const popupRoot = form?.closest('[data-popup-kind="point-address-search"]');
+    const input = form?.querySelector('[data-role="point-address-search-input"]');
+    const query = String(input?.value || '').trim();
+    const lng = Number(popupRoot?.dataset.originLng);
+    const lat = Number(popupRoot?.dataset.originLat);
+    if (!query || !Number.isFinite(lng) || !Number.isFinite(lat)) {
+      input?.focus();
+      return;
+    }
+    if (!this.pointAddressSearchProvider) return;
+
+    const requestToken = ++this.pointAddressSearchRequestToken;
+    this.showPointAddressSearchPopup(lng, lat, {
+      query,
+      loading: true,
+      statusHtml: 'Searching for matching addresses...'
+    });
+    try {
+      const context = this.getPointAddressSearchContext(lng, lat);
+      const results = await this.pointAddressSearchProvider.search(query, context);
+      if (requestToken !== this.pointAddressSearchRequestToken) return;
+      this.pointAddressSearchResults = Array.isArray(results) ? results : [];
+      this.showPointAddressSearchPopup(lng, lat, {
+        query,
+        results: this.pointAddressSearchResults,
+        statusHtml: this.pointAddressSearchResults.length
+          ? 'Choose an address to move the map.'
+          : 'No matching addresses were found.'
+      });
+    } catch (error) {
+      if (requestToken !== this.pointAddressSearchRequestToken) return;
+      this.pointAddressSearchResults = [];
+      const message = this._escapePopupHtml(error?.message || 'Address search failed.');
+      this.showPointAddressSearchPopup(lng, lat, {
+        query,
+        statusHtml: `<span class="blank-map-popup-error">${message}</span>`
+      });
+    }
+  },
+
+  async selectPointAddressResult(resultIndex, popupRoot) {
+    const candidate = this.pointAddressSearchResults[resultIndex];
+    if (!candidate || !this.pointAddressSearchProvider) return;
+    const originLng = Number(popupRoot?.dataset.originLng);
+    const originLat = Number(popupRoot?.dataset.originLat);
+    const query = String(popupRoot?.querySelector('[data-role="point-address-search-input"]')?.value || '');
+    const requestToken = ++this.pointAddressSearchRequestToken;
+
+    try {
+      const candidateHasCoordinates = candidate.lng !== null && candidate.lng !== undefined
+        && candidate.lat !== null && candidate.lat !== undefined
+        && Number.isFinite(Number(candidate.lng)) && Number.isFinite(Number(candidate.lat));
+      const selection = candidateHasCoordinates
+        ? candidate
+        : await this.pointAddressSearchProvider.resolve?.(candidate);
+      if (requestToken !== this.pointAddressSearchRequestToken) return;
+      const lng = Number(selection?.lng);
+      const lat = Number(selection?.lat);
+      if (selection?.lng === null || selection?.lng === undefined
+        || selection?.lat === null || selection?.lat === undefined
+        || !Number.isFinite(lng) || !Number.isFinite(lat)) {
+        throw new Error('The selected address did not return coordinates.');
+      }
+
+      this.map?.flyTo({
+        center: [lng, lat],
+        zoom: Math.max(Number(this.map?.getZoom?.()) || 0, 16),
+        duration: 1200
+      });
+      this.pointAddressSearchResults = [];
+      await this.resolvePointPopupLookup({ dataset: { lng: String(lng), lat: String(lat) } });
+    } catch (error) {
+      if (requestToken !== this.pointAddressSearchRequestToken) return;
+      const message = this._escapePopupHtml(error?.message || 'Could not use that address.');
+      this.showPointAddressSearchPopup(originLng, originLat, {
+        query,
+        results: this.pointAddressSearchResults,
+        statusHtml: `<span class="blank-map-popup-error">${message}</span>`
+      });
+    }
   },
 
   async resolvePointPopupLookup(button) {
@@ -1741,6 +1953,42 @@ export const MapAdapter = {
         return;
       }
 
+      const openAddressButton = e.target.closest('[data-action="open-point-address-search"]');
+      if (openAddressButton) {
+        e.preventDefault();
+        clearTimeout(this.pointAddressSearchDebounceTimer);
+        this.pointResolveRequestToken += 1;
+        this.pointAddressSearchRequestToken += 1;
+        this.pointAddressSearchResults = [];
+        this.showPointAddressSearchPopup(
+          Number(openAddressButton.dataset.lng),
+          Number(openAddressButton.dataset.lat)
+        );
+        return;
+      }
+
+      const closeAddressButton = e.target.closest('[data-action="close-point-address-search"]');
+      if (closeAddressButton) {
+        e.preventDefault();
+        const popupRoot = closeAddressButton.closest('[data-popup-kind="point-address-search"]');
+        clearTimeout(this.pointAddressSearchDebounceTimer);
+        this.pointAddressSearchRequestToken += 1;
+        this.pointAddressSearchResults = [];
+        this.showPointInspectorPopup({
+          lng: Number(popupRoot?.dataset.originLng),
+          lat: Number(popupRoot?.dataset.originLat)
+        }, { subtitle: 'Map click' });
+        return;
+      }
+
+      const addressResultButton = e.target.closest('[data-action="select-point-address"]');
+      if (addressResultButton) {
+        e.preventDefault();
+        const popupRoot = addressResultButton.closest('[data-popup-kind="point-address-search"]');
+        this.selectPointAddressResult(Number(addressResultButton.dataset.resultIndex), popupRoot);
+        return;
+      }
+
       const metricSectionHeader = e.target.closest('[data-action="select-metric-display"]');
       if (metricSectionHeader) {
         e.preventDefault();
@@ -1768,6 +2016,30 @@ export const MapAdapter = {
         return;
       }
 
+    });
+    el.addEventListener('submit', (e) => {
+      const addressForm = e.target.closest('[data-role="point-address-search-form"]');
+      if (!addressForm) return;
+      e.preventDefault();
+      clearTimeout(this.pointAddressSearchDebounceTimer);
+      this.searchPointAddresses(addressForm);
+    });
+    el.addEventListener('input', (e) => {
+      const addressInput = e.target.closest('[data-role="point-address-search-input"]');
+      if (!addressInput || !this.pointAddressSearchProvider) return;
+      clearTimeout(this.pointAddressSearchDebounceTimer);
+      const query = String(addressInput.value || '').trim();
+      const status = el.querySelector('[data-role="point-address-search-status"]');
+      if (query.length < 3) {
+        this.pointAddressSearchResults = [];
+        this.pointAddressSearchRequestToken += 1;
+        if (status) status.textContent = 'Type at least 3 characters for suggestions.';
+        return;
+      }
+      this.pointAddressSearchDebounceTimer = setTimeout(() => {
+        if (!el.contains(addressInput)) return;
+        this.searchPointAddresses(addressInput.form);
+      }, 300);
     });
   },
 

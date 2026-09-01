@@ -2699,11 +2699,104 @@ body.tutorial-mode .popup-tutorial-wrap {
 }
 
 .blank-map-popup-actions {
+  display: grid;
+  gap: 7px;
   margin-top: 10px;
 }
 
 .blank-map-popup-button {
   width: 100%;
+}
+
+.blank-map-popup-address-button {
+  border-color: rgba(142, 216, 255, 0.42);
+  background: rgba(14, 116, 144, 0.16);
+  color: #c4ecff;
+}
+
+.blank-map-popup--address {
+  min-width: 250px;
+  max-width: 290px;
+}
+
+.blank-map-popup-address-form {
+  display: grid;
+  gap: 7px;
+}
+
+.blank-map-popup-address-label {
+  font-size: 11px;
+  color: #c7d3e3;
+}
+
+.blank-map-popup-address-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(148, 163, 184, 0.38);
+  border-radius: 8px;
+  outline: none;
+  background: rgba(15, 23, 42, 0.92);
+  color: #f8fafc;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 8px 10px;
+}
+
+.blank-map-popup-address-input:focus {
+  border-color: #8ed8ff;
+  box-shadow: 0 0 0 2px rgba(142, 216, 255, 0.16);
+}
+
+.blank-map-popup-address-results {
+  display: grid;
+  gap: 5px;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+.blank-map-popup-address-result {
+  width: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 7px;
+  background: rgba(30, 41, 59, 0.86);
+  color: #e5edf7;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.blank-map-popup-address-result:hover,
+.blank-map-popup-address-result:focus-visible {
+  border-color: rgba(142, 216, 255, 0.62);
+  background: rgba(14, 116, 144, 0.24);
+}
+
+.blank-map-popup-address-status {
+  margin-top: 8px;
+  color: #9fb1c7;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.blank-map-popup-back-button {
+  border: 0;
+  background: transparent;
+  color: #8ed8ff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  margin-top: 9px;
+  padding: 0;
+}
+
+.blank-map-popup-back-button:hover {
+  color: #c4ecff;
+  text-decoration: underline;
 }
 
 .blank-map-popup-status {

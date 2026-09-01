@@ -22,6 +22,7 @@ admin_0_loc_id, admin_1_loc_id, admin_2_loc_id, admin_3_loc_id,
 admin_4_loc_id, admin_5_loc_id, admin_6_loc_id,
 bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat
 """
+ROUTE_INDEX_NAME = "loc_id_routes.parquet"
 
 
 @lru_cache(maxsize=64)
@@ -61,6 +62,26 @@ def layout_available(iso3: str) -> bool:
 def clear_admin_spine_query_cache() -> None:
     layout_root.cache_clear()
     _published_layout_manifest_available.cache_clear()
+    _layout_manifest.cache_clear()
+
+
+@lru_cache(maxsize=64)
+def _layout_manifest(iso3: str) -> dict[str, Any]:
+    root = layout_root(iso3)
+    if not is_cloud_mode():
+        path = root / "manifest.json"
+        if not path.is_file():
+            return {}
+        try:
+            import json
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    try:
+        relative = root.relative_to(Path(DATA_ROOT)).as_posix()
+        return read_artifact_json(f"{relative}/manifest.json", lane="active")
+    except Exception:
+        return {}
 
 
 @lru_cache(maxsize=64)
@@ -201,14 +222,45 @@ def load_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[str] | Non
         else ", ".join(f'"{name}"' for name in projection)
     )
     root = layout_root(iso3)
+    manifest = _layout_manifest(iso3)
+    route_index_required = bool((manifest.get("route_index") or {}).get("path") == ROUTE_INDEX_NAME)
+    route_rows: dict[str, tuple[int, str]] = {}
+    route_path = root / ROUTE_INDEX_NAME
+    if route_index_required or route_path.is_file():
+        route_connection = _connection()
+        try:
+            placeholders = ",".join("?" for _ in requested)
+            rows = route_connection.execute(
+                f"SELECT loc_id, admin_level, admin_1_loc_id FROM read_parquet(?) "
+                f"WHERE loc_id IN ({placeholders})",
+                [path_to_uri(route_path), *requested],
+            ).fetchall()
+            route_rows = {
+                str(loc_id): (int(admin_level), str(owner or ""))
+                for loc_id, admin_level, owner in rows
+            }
+        except Exception:
+            if route_index_required:
+                return pd.DataFrame()
+            route_rows = {}
+        finally:
+            route_connection.close()
     requests_by_path: dict[Path, list[str]] = {}
     for loc_id in requested:
-        parts = loc_id.split("-")
-        admin_level = len(parts) - 1
+        route = route_rows.get(loc_id)
+        if route is not None:
+            admin_level, owner_loc_id = route
+        elif route_index_required:
+            # A modern layout's explicit routing table is authoritative. An
+            # unknown ID must not be guessed from punctuation.
+            continue
+        else:
+            parts = loc_id.split("-")
+            admin_level = len(parts) - 1
+            owner_loc_id = "-".join(parts[:2])
         if admin_level <= 3:
             path = root / "admin_0_3.parquet"
         else:
-            owner_loc_id = "-".join(parts[:2])
             path = root / "deep" / f"{owner_loc_id}.parquet"
         requests_by_path.setdefault(path, []).append(loc_id)
     connection = _connection()
