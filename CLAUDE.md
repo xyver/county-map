@@ -16,6 +16,37 @@ business docs, and operational runbooks belong in the private repo, not here.
 
 ---
 
+## Research and search
+
+When asked to read, research, search, or investigate something, do it
+completely before answering or building. Partial reads that agree with each
+other feel like coverage and are not.
+
+**Docs before code.** Start at [docs/CONTEXT.md](docs/CONTEXT.md), the
+start-here router. Follow every route it names for the topic, not just the
+first one that matches the immediate question - the owning doc usually names
+the owning code and the known gaps.
+
+**Read to the end.** Do not stop when the immediate question is answered.
+Ownership tables, change procedures, and "remaining gaps" sections sit at the
+bottom of a doc, and those are the parts that say whether the thing you are
+about to build already exists.
+
+**Finish the search before concluding.** Do not cap a discovery search with
+`head` and treat the result as the inventory - results sort alphabetically, so
+a cap silently hides whatever sorts late. Either take the full list, or count it
+first and say out loud that you are looking at a sample.
+
+**Search by concept, not by guessed implementation.** The thing that already
+exists may be a `.md`, `.json`, or `.csv` rather than the `.py` you assumed.
+Search all file types before concluding nothing owns a job.
+
+**Assume an owner exists.** Before writing a new script, table, or mapping, find
+the current owner and extend it. A parallel path that duplicates an existing one
+is worse than no change.
+
+---
+
 ## Serialization: MessagePack, not JSON
 
 All API responses use MessagePack.
