@@ -303,29 +303,68 @@ def _reference_family(loc_id: str, *, admin_level: Any = None) -> str | None:
 
 
 def _canonical_graph_loc_id(loc_id: str) -> str:
-    """Resolve a retired loc_id alias without guessing between multiple versions."""
+    """Resolve a preferred public loc_id without guessing between targets."""
     canonical = canonicalize_loc_id(loc_id)
-    family = classify_loc_id_family(canonical)
-    if str(family or "").startswith("admin"):
-        # Current admin IDs are already canonical. Point resolution emits these
-        # exact values, so do not scan a country reference graph before the
-        # bounded admin-spine geometry lookup gets a chance to serve them.
-        return canonical
     try:
-        from .reference_graph import identify_aliases, identity as graph_identity
+        from .reference_graph import resolve_public_loc_id
 
-        if graph_identity(canonical):
-            return canonical
-        resolved = {
-            str(row.get("loc_id") or "").strip()
-            for row in identify_aliases([canonical], limit=50)
-            if str(row.get("loc_id") or "").strip()
-        }
-        if len(resolved) == 1:
-            return next(iter(resolved))
+        resolved = resolve_public_loc_id(canonical)
+        if resolved.get("ok") and resolved.get("loc_id"):
+            return str(resolved["loc_id"])
     except Exception:
         pass
     return canonical
+
+
+def resolve_loc_id_input(loc_id: str) -> dict[str, Any]:
+    """Return canonical input metadata for any runtime accepting a loc_id."""
+    canonical = canonicalize_loc_id(loc_id)
+    fallback = {
+        "ok": True,
+        "status": "unchanged",
+        "requested_loc_id": canonical,
+        "loc_id": canonical,
+        "resolved_from_public_alias": False,
+    }
+    try:
+        from .reference_graph import resolve_public_loc_id
+
+        return resolve_public_loc_id(canonical)
+    except Exception:
+        # A graph outage must not disable canonical geometry-bank lookup.
+        return fallback
+
+
+def _public_alias_error(resolution: dict[str, Any], *, shape: bool = False) -> dict[str, Any]:
+    result = {
+        "ok": False,
+        "loc_id": resolution.get("requested_loc_id"),
+        "requested_loc_id": resolution.get("requested_loc_id"),
+        "canonical_loc_id": None,
+        "error": resolution.get("error") or {
+            "code": "public_loc_id_resolution_failed",
+            "message": "preferred public loc_id could not be resolved safely",
+        },
+    }
+    if resolution.get("candidate_loc_ids"):
+        result["candidate_loc_ids"] = resolution.get("candidate_loc_ids")
+    if resolution.get("reference_systems"):
+        result["reference_systems"] = resolution.get("reference_systems")
+    if shape:
+        result["has_shape"] = False
+    return result
+
+
+def _attach_public_alias_resolution(result: dict[str, Any], resolution: dict[str, Any]) -> dict[str, Any]:
+    if not resolution.get("resolved_from_public_alias"):
+        return result
+    return {
+        **result,
+        "requested_loc_id": resolution.get("requested_loc_id"),
+        "resolved_from_public_alias": True,
+        "public_alias": resolution.get("public_alias"),
+        "public_alias_reference_system": resolution.get("reference_system"),
+    }
 
 
 def _clean_json(value: Any) -> Any:
@@ -440,6 +479,7 @@ SELF_RESOLVING_RESOLVERS = frozenset({
 
 _ALWAYS_EXCHANGEABLE_ROLES = frozenset({
     "reserve", "exact_identifier_system", "external_reference_bridge", "canonical_reference_system",
+    "preferred_public_loc_id",
 })
 
 
@@ -465,6 +505,7 @@ def _mark_exchangeability(system: dict[str, Any], crosswalk_systems: set[str]) -
         system["exchangeable"] = True
         system["exchange_via"] = (
             "reserve" if role == "reserve" else
+            "preferred_public_loc_id" if role == "preferred_public_loc_id" else
             "canonical_crosswalk" if role == "canonical_reference_system" else
             "typed_external_reference_edges" if role == "external_reference_bridge" else
             "exact_identifier_crosswalk"
@@ -682,6 +723,23 @@ def list_reference_systems(
     for adapter in admitted_external_adapters():
         if adapter_available(adapter):
             systems[adapter.system] = adapter_public_entry(adapter)
+    try:
+        from .reference_graph import public_alias_reference_systems
+
+        for entry in public_alias_reference_systems(iso3=country or None):
+            system = str(entry.get("system") or "").strip()
+            if not system:
+                continue
+            systems[system] = {
+                **entry,
+                "label": "DaedalMap preferred public loc_id",
+                "role": "preferred_public_loc_id",
+                "country_scope": country or (system.split(".")[2].upper() if len(system.split(".")) > 2 else None),
+                "bidirectional": True,
+                "resolver": "preferred_public_loc_id",
+            }
+    except Exception:
+        pass
     for family in catalog.get("geometry_families") or []:
         if not isinstance(family, dict):
             continue
@@ -1101,7 +1159,15 @@ def read_geometry_catalog(
 
 
 def _direct_loc_id_result(value: str, *, request_system: str) -> dict[str, Any]:
-    loc_id = canonicalize_loc_id(value)
+    resolution = resolve_loc_id_input(value)
+    if not resolution.get("ok"):
+        return {
+            **_public_alias_error(resolution),
+            "from_system": request_system,
+            "input": value,
+            "resolved_loc_id": None,
+        }
+    loc_id = str(resolution.get("loc_id") or canonicalize_loc_id(value))
     if not loc_id:
         return {
             "ok": False,
@@ -1128,7 +1194,7 @@ def _direct_loc_id_result(value: str, *, request_system: str) -> dict[str, Any]:
                 "message": "no maintained identity or geometry matches that loc_id",
             },
         }
-    return {
+    return _attach_public_alias_resolution({
         "ok": True,
         "from_system": request_system,
         "input": value,
@@ -1136,7 +1202,7 @@ def _direct_loc_id_result(value: str, *, request_system: str) -> dict[str, Any]:
         "resolved_family": classify_loc_id_family(loc_id),
         "match_type": "loc_id_passthrough",
         "references": [{"system": LOC_ID_SYSTEM, "value": loc_id, "role": "reserve"}],
-    }
+    }, resolution)
 
 
 def _admin_text_result(value: str, *, country_hint: str | None, admin_level_hint: int | None, request_system: str) -> dict[str, Any]:
@@ -1175,7 +1241,7 @@ def resolve_reference(
     text = str(value or "").strip()
     if not text:
         return {"ok": False, "from_system": system, "input": value, "error": "value is required"}
-    if system in {LOC_ID_SYSTEM, "admin_local", "admin_geometry"}:
+    if system in {LOC_ID_SYSTEM, "admin_local", "admin_geometry"} or system.startswith("daedalmap.public."):
         return _clean_json(_direct_loc_id_result(text, request_system=system))
     if get_external_adapter(system):
         # External edges own their typed relationship and two release clocks.
@@ -1461,7 +1527,10 @@ def loc_id_references(
     internal_release: str | None = None,
 ) -> dict[str, Any]:
     """Return known references that point at a ``loc_id``."""
-    canonical = canonicalize_loc_id(loc_id)
+    resolution = resolve_loc_id_input(loc_id)
+    if not resolution.get("ok"):
+        return _public_alias_error(resolution)
+    canonical = str(resolution.get("loc_id") or canonicalize_loc_id(loc_id))
     family = classify_loc_id_family(canonical)
     try:
         from .reference_graph import identity as graph_identity
@@ -1596,7 +1665,10 @@ def loc_id_references(
         pass
     if requested:
         references = [ref for ref in references if ref.get("system") in requested or ref.get("system") == LOC_ID_SYSTEM]
-    return _clean_json({"ok": bool(canonical), "loc_id": canonical, "family": family, "references": references, "reference_count": len(references)})
+    return _clean_json(_attach_public_alias_resolution(
+        {"ok": bool(canonical), "loc_id": canonical, "family": family, "references": references, "reference_count": len(references)},
+        resolution,
+    ))
 
 
 def convert_reference(
@@ -1762,7 +1834,8 @@ def get_geometry_references(
     include_info: bool = True,
 ) -> dict[str, Any]:
     """Return geometry metadata for one or more loc_ids using one geometry fetch pipeline."""
-    canonical_ids = [_canonical_graph_loc_id(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    resolutions = [resolve_loc_id_input(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    canonical_ids = [str(item.get("loc_id")) for item in resolutions if item.get("ok") and item.get("loc_id")]
     if not include_polygon:
         rows = get_selection_geometry_metadata(canonical_ids)
         by_loc_id: dict[str, dict[str, Any]] = {}
@@ -1770,17 +1843,21 @@ def get_geometry_references(
             row_loc_id = row.get("loc_id") or row.get("source_loc_id")
             if row_loc_id:
                 by_loc_id[canonicalize_loc_id(str(row_loc_id))] = row
-        results = [
-            _metadata_geometry_reference(loc_id, by_loc_id.get(loc_id), include_info=include_info)
-            for loc_id in canonical_ids
-        ]
+        results = []
+        for resolution in resolutions:
+            if not resolution.get("ok"):
+                results.append(_public_alias_error(resolution, shape=True))
+                continue
+            canonical = str(resolution.get("loc_id"))
+            result = _metadata_geometry_reference(canonical, by_loc_id.get(canonical), include_info=include_info)
+            results.append(_attach_public_alias_resolution(result, resolution))
         available = sum(1 for result in results if result.get("has_shape"))
         return _clean_json(
             {
                 "ok": bool(results),
-                "requested": len(canonical_ids),
+                "requested": len(resolutions),
                 "available": available,
-                "missing": len(canonical_ids) - available,
+                "missing": len(resolutions) - available,
                 "results": results,
             }
         )
@@ -1793,17 +1870,21 @@ def get_geometry_references(
         feature_loc_id = props.get("local_loc_id") or props.get("loc_id")
         if feature_loc_id:
             by_loc_id[canonicalize_loc_id(str(feature_loc_id))] = feature
-    results = [
-        _shape_geometry_reference(loc_id, by_loc_id.get(loc_id), include_polygon=include_polygon, include_info=include_info)
-        for loc_id in canonical_ids
-    ]
+    results = []
+    for resolution in resolutions:
+        if not resolution.get("ok"):
+            results.append(_public_alias_error(resolution, shape=True))
+            continue
+        canonical = str(resolution.get("loc_id"))
+        result = _shape_geometry_reference(canonical, by_loc_id.get(canonical), include_polygon=include_polygon, include_info=include_info)
+        results.append(_attach_public_alias_resolution(result, resolution))
     available = sum(1 for result in results if result.get("has_shape"))
     return _clean_json(
         {
             "ok": bool(results),
-            "requested": len(canonical_ids),
+            "requested": len(resolutions),
             "available": available,
-            "missing": len(canonical_ids) - available,
+            "missing": len(resolutions) - available,
             "results": results,
         }
     )
@@ -1811,7 +1892,8 @@ def get_geometry_references(
 
 def get_geometry_availability(loc_ids: list[str]) -> dict[str, Any]:
     """Return a lightweight shape-availability preflight for one or more loc_ids."""
-    canonical_ids = [_canonical_graph_loc_id(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    resolutions = [resolve_loc_id_input(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    canonical_ids = [str(item.get("loc_id")) for item in resolutions if item.get("ok") and item.get("loc_id")]
     rows = get_selection_geometry_metadata(canonical_ids)
     by_loc_id: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -1819,7 +1901,11 @@ def get_geometry_availability(loc_ids: list[str]) -> dict[str, Any]:
         if row_loc_id:
             by_loc_id[canonicalize_loc_id(str(row_loc_id))] = row
     items = []
-    for loc_id in canonical_ids:
+    for resolution in resolutions:
+        if not resolution.get("ok"):
+            items.append(_public_alias_error(resolution, shape=True))
+            continue
+        loc_id = str(resolution.get("loc_id"))
         result = by_loc_id.get(loc_id)
         has_shape = bool(result)
         item = {
@@ -1838,14 +1924,14 @@ def get_geometry_availability(loc_ids: list[str]) -> dict[str, Any]:
         }
         if not item["has_shape"]:
             item["error"] = "no geometry found"
-        items.append(item)
+        items.append(_attach_public_alias_resolution(item, resolution))
     available = sum(1 for item in items if item.get("has_shape"))
     return _clean_json(
         {
-            "ok": bool(canonical_ids),
-            "requested": len(canonical_ids),
+            "ok": bool(resolutions),
+            "requested": len(resolutions),
             "available": available,
-            "missing": len(canonical_ids) - available,
+            "missing": len(resolutions) - available,
             "items": items,
             "results": items,
         }

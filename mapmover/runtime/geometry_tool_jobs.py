@@ -29,6 +29,7 @@ from .reference_exchange import (
     convert_reference,
     get_geometry_availability,
     get_geometry_references,
+    resolve_loc_id_input,
     resolve_reference,
     resolve_references_batch,
 )
@@ -298,6 +299,16 @@ def resolve_loc_id_scope(payload: dict[str, Any], *, default_limit: int | None =
     admin_level = _admin_level_value(scope.get("admin_level") if isinstance(scope, dict) else payload.get("admin_level"))
     if not parent_loc_id:
         return {"ok": False, "error": {"code": "invalid_scope", "message": "parent_loc_id is required"}}
+    parent_resolution = resolve_loc_id_input(parent_loc_id)
+    if not parent_resolution.get("ok"):
+        return _clean_json({
+            "ok": False,
+            "parent_loc_id": parent_loc_id,
+            "error": parent_resolution.get("error"),
+            "candidate_loc_ids": parent_resolution.get("candidate_loc_ids"),
+        })
+    requested_parent_loc_id = parent_loc_id
+    parent_loc_id = str(parent_resolution.get("loc_id") or parent_loc_id)
     if admin_level is None:
         return {"ok": False, "error": {"code": "invalid_scope", "message": "admin_level is required"}}
     bbox = _bbox_value(scope.get("bbox") if isinstance(scope, dict) else payload.get("bbox"))
@@ -313,8 +324,7 @@ def resolve_loc_id_scope(payload: dict[str, Any], *, default_limit: int | None =
     rows = [_row_summary(row) for row in _scope_rows(parent_loc_id, admin_level, bbox)]
     total = len(rows)
     page = [] if count_only else (rows[offset:] if limit is None else rows[offset : offset + limit])
-    return _clean_json(
-        {
+    result = {
             "ok": True,
             "parent_loc_id": parent_loc_id,
             "admin_level": admin_level,
@@ -327,7 +337,13 @@ def resolve_loc_id_scope(payload: dict[str, Any], *, default_limit: int | None =
             "loc_ids": [row.get("loc_id") for row in page if row.get("loc_id")],
             "rows": page,
         }
-    )
+    if parent_resolution.get("resolved_from_public_alias"):
+        result.update({
+            "requested_parent_loc_id": requested_parent_loc_id,
+            "resolved_from_public_alias": True,
+            "public_alias_reference_system": parent_resolution.get("reference_system"),
+        })
+    return _clean_json(result)
 
 
 def _loc_ids_from_request(payload: dict[str, Any], *, scope_limit: int | None = 10000) -> tuple[list[str], dict[str, Any] | None]:

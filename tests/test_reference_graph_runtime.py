@@ -10,11 +10,19 @@ from unittest import mock
 import pandas as pd
 
 from mapmover.geometry_handlers import get_location_info
-from mapmover.runtime.reference_exchange import loc_id_references, resolve_reference
+from mapmover.runtime.reference_exchange import (
+    get_geometry_availability,
+    get_geometry_references,
+    list_reference_systems,
+    loc_id_references,
+    resolve_reference,
+)
 from mapmover.runtime.reference_graph import (
     aliases_for_loc_id,
     identity,
+    public_alias_reference_systems,
     relationships_for_loc_id,
+    resolve_public_loc_id,
     where_is_geography_data,
 )
 from mapmover.runtime import reference_graph
@@ -45,6 +53,18 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
             "reference_system": "test.code", "external_id": "001",
             "loc_id": "TST-A-001", "alias_type": "official_code",
             "source_system": "Test Authority", "source_vintage": "2026",
+        }, {
+            "reference_system": "daedalmap.public.tst.test_sidechain.v1", "external_id": "TST-PUBLIC-A",
+            "loc_id": "TST-A-001", "alias_type": "preferred_public_loc_id",
+            "source_system": "DaedalMap", "source_vintage": "2026",
+        }, {
+            "reference_system": "daedalmap.public.tst.test_sidechain.v1", "external_id": "TST-PUBLIC-AMBIG",
+            "loc_id": "TST-A-001", "alias_type": "preferred_public_loc_id",
+            "source_system": "DaedalMap", "source_vintage": "2026",
+        }, {
+            "reference_system": "daedalmap.public.tst.test_sidechain.v1", "external_id": "TST-PUBLIC-AMBIG",
+            "loc_id": "TST-B-002", "alias_type": "preferred_public_loc_id",
+            "source_system": "DaedalMap", "source_vintage": "2026",
         }]).to_parquet(self.root / "aliases.parquet", index=False)
         pd.DataFrame([{
             "relationship_id": "TST-REL-1", "source_family": "test_sidechain",
@@ -71,7 +91,7 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
         }]).to_parquet(self.root / "identity_partitions.parquet", index=False)
         pd.DataFrame([{
             "partition_id": "test_sidechain", "family": "test_sidechain",
-            "path": str(self.root / "aliases.parquet"), "sha256": "test", "row_count": 1,
+            "path": str(self.root / "aliases.parquet"), "sha256": "test", "row_count": 4,
         }]).to_parquet(self.root / "alias_partitions.parquet", index=False)
         pd.DataFrame([{
             "partition_id": "test_relationships", "semantic_type": "measured_spatial_overlap",
@@ -115,8 +135,58 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
 
     def test_identity_alias_and_relationship_queries(self) -> None:
         self.assertEqual(identity("TST-A-001")["family"], "test_sidechain")
-        self.assertEqual(aliases_for_loc_id("TST-A-001")[0]["external_id"], "001")
+        self.assertTrue(any(row["external_id"] == "001" for row in aliases_for_loc_id("TST-A-001")))
         self.assertEqual(relationships_for_loc_id("TST-A-001")[0]["target_loc_id"], "TST-B-002")
+
+    def test_preferred_public_loc_id_resolves_and_is_discoverable(self) -> None:
+        resolved = resolve_public_loc_id("tst-public-a")
+        self.assertTrue(resolved["ok"])
+        self.assertEqual(resolved["loc_id"], "TST-A-001")
+        self.assertEqual(resolved["reference_system"], "daedalmap.public.tst.test_sidechain.v1")
+        systems = public_alias_reference_systems(iso3="TST")
+        self.assertEqual(systems[0]["public_id_count"], 2)
+        listed = {row["system"]: row for row in list_reference_systems(country_scope="TST")["systems"]}
+        public = listed["daedalmap.public.tst.test_sidechain.v1"]
+        self.assertTrue(public["exchangeable"])
+        self.assertEqual(public["exchange_via"], "preferred_public_loc_id")
+
+    def test_preferred_public_loc_id_ambiguity_fails_closed(self) -> None:
+        resolved = resolve_public_loc_id("TST-PUBLIC-AMBIG")
+        self.assertFalse(resolved["ok"])
+        self.assertEqual(resolved["error"]["code"], "ambiguous_public_loc_id")
+        self.assertEqual(resolved["candidate_loc_ids"], ["TST-A-001", "TST-B-002"])
+        direct = resolve_reference(
+            from_system="daedalmap.public.tst.test_sidechain.v1",
+            value="TST-PUBLIC-AMBIG",
+            iso3="TST",
+        )
+        self.assertFalse(direct["ok"])
+        self.assertIsNone(direct["resolved_loc_id"])
+
+    def test_geometry_calls_preserve_canonical_output_and_requested_public_alias(self) -> None:
+        metadata = [{
+            "loc_id": "TST-A-001", "name": "Test Area", "admin_level": None,
+            "centroid_lon": 1.0, "centroid_lat": 2.0,
+            "bbox_min_lon": 0.0, "bbox_min_lat": 1.0,
+            "bbox_max_lon": 2.0, "bbox_max_lat": 3.0,
+        }]
+        with mock.patch(
+            "mapmover.runtime.reference_exchange.get_selection_geometry_metadata",
+            return_value=metadata,
+        ):
+            checked = get_geometry_availability(["TST-PUBLIC-A", "TST-PUBLIC-AMBIG"])
+            fetched = get_geometry_references(["TST-PUBLIC-A"], include_polygon=False, include_info=False)
+        self.assertEqual(checked["items"][0]["loc_id"], "TST-A-001")
+        self.assertEqual(checked["items"][0]["requested_loc_id"], "TST-PUBLIC-A")
+        self.assertEqual(checked["items"][1]["error"]["code"], "ambiguous_public_loc_id")
+        self.assertEqual(fetched["results"][0]["loc_id"], "TST-A-001")
+        self.assertEqual(fetched["results"][0]["public_alias"], "TST-PUBLIC-A")
+
+    def test_loc_id_references_accepts_preferred_public_alias(self) -> None:
+        result = loc_id_references("TST-PUBLIC-A", limit_per_system=5)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["loc_id"], "TST-A-001")
+        self.assertEqual(result["requested_loc_id"], "TST-PUBLIC-A")
 
     def test_relationship_query_avoids_global_order_by(self) -> None:
         statements: list[str] = []

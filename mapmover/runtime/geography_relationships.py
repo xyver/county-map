@@ -338,8 +338,23 @@ def compare_geographies(
     geometry_fetcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compare two identities in time and, when available, exact geometry."""
-    left_id = str(left_loc_id or "").strip().upper()
-    right_id = str(right_loc_id or "").strip().upper()
+    from .reference_exchange import resolve_loc_id_input
+
+    left_resolution = resolve_loc_id_input(left_loc_id)
+    right_resolution = resolve_loc_id_input(right_loc_id)
+    failed = [item for item in (left_resolution, right_resolution) if not item.get("ok")]
+    if failed:
+        return {
+            "ok": False,
+            "error": failed[0].get("error") or {
+                "code": "public_loc_id_resolution_failed",
+                "message": "preferred public loc_id could not be resolved safely",
+            },
+            "left_resolution": left_resolution,
+            "right_resolution": right_resolution,
+        }
+    left_id = str(left_resolution.get("loc_id") or "").strip().upper()
+    right_id = str(right_resolution.get("loc_id") or "").strip().upper()
     if not left_id or not right_id:
         return {"ok": False, "error": {"code": "invalid_comparison", "message": "left_loc_id and right_loc_id are required"}}
     common_when = _parse_date(as_of, field="as_of")
@@ -347,6 +362,12 @@ def compare_geographies(
     right_when = _parse_date(right_as_of, field="right_as_of") or common_when
     left_identity = _identity_state(left_id, left_when)
     right_identity = _identity_state(right_id, right_when)
+    if left_resolution.get("resolved_from_public_alias"):
+        left_identity["requested_loc_id"] = left_resolution.get("requested_loc_id")
+        left_identity["resolved_from_public_alias"] = True
+    if right_resolution.get("resolved_from_public_alias"):
+        right_identity["requested_loc_id"] = right_resolution.get("requested_loc_id")
+        right_identity["resolved_from_public_alias"] = True
     if not include_successors:
         for identity in (left_identity, right_identity):
             identity.pop("direct_successors", None)

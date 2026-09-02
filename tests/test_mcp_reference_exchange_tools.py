@@ -807,6 +807,63 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         self.assertEqual(payload["reference_count"], 1)
         self.assertEqual(payload["references"]["references"][0]["system"], "overlay_nws_fire_weather_zone")
 
+    def test_loc_id_info_accepts_preferred_public_alias_and_returns_canonical_id(self) -> None:
+        with (
+            mock.patch(
+                "mapmover.runtime.reference_exchange.resolve_loc_id_input",
+                return_value={
+                    "ok": True,
+                    "status": "resolved",
+                    "requested_loc_id": "USA-PLACE-SPRINGFIELD-IL",
+                    "loc_id": "USA-IL-167-PLACE-12345",
+                    "resolved_from_public_alias": True,
+                    "public_alias": "USA-PLACE-SPRINGFIELD-IL",
+                    "reference_system": "daedalmap.public.usa.place.v1",
+                },
+            ),
+            mock.patch(
+                "mapmover.geometry_handlers.get_location_info",
+                return_value={
+                    "loc_id": "USA-IL-167-PLACE-12345", "name": "Springfield",
+                    "family": "place_or_municipality", "iso3": "USA",
+                },
+            ) as info_mock,
+        ):
+            payload = _tool_call(
+                self.client,
+                "loc_id_info",
+                {"loc_id": "USA-PLACE-SPRINGFIELD-IL"},
+            )
+
+        info_mock.assert_called_once_with("USA-IL-167-PLACE-12345", include_memberships=False)
+        self.assertEqual(payload["loc_id"], "USA-IL-167-PLACE-12345")
+        self.assertEqual(payload["requested_loc_id"], "USA-PLACE-SPRINGFIELD-IL")
+        self.assertTrue(payload["resolved_from_public_alias"])
+
+    def test_loc_id_info_rejects_ambiguous_preferred_public_alias(self) -> None:
+        with (
+            mock.patch(
+                "mapmover.runtime.reference_exchange.resolve_loc_id_input",
+                return_value={
+                    "ok": False,
+                    "requested_loc_id": "USA-PLACE-SPRINGFIELD",
+                    "loc_id": None,
+                    "candidate_loc_ids": ["USA-IL-167-PLACE-12345", "USA-MO-077-PLACE-67890"],
+                    "error": {"code": "ambiguous_public_loc_id", "message": "ambiguous"},
+                },
+            ),
+            mock.patch("mapmover.geometry_handlers.get_location_info") as info_mock,
+        ):
+            payload = _tool_call(
+                self.client,
+                "loc_id_info",
+                {"loc_id": "USA-PLACE-SPRINGFIELD"},
+            )
+
+        info_mock.assert_not_called()
+        self.assertEqual(payload["error"]["code"], "ambiguous_public_loc_id")
+        self.assertIsNone(payload["canonical_loc_id"])
+
     def test_loc_id_info_hierarchy_follows_stored_country_parentage(self) -> None:
         rows = {
             "CAN-BC-5915004": {

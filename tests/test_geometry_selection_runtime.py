@@ -296,6 +296,28 @@ class GeometrySelectionRuntimeTests(unittest.TestCase):
         direct_loader.assert_called_once_with("USA", ["USA-CA-TRIBAL-4760"])
         deep_loader.assert_not_called()
 
+    def test_graph_shape_ownership_routes_deep_sidechain_before_admin_layout(self):
+        loc_id = "AUS-ACT-801-LOCALGOV-89399"
+        graph_df = pd.DataFrame([{
+            "loc_id": loc_id,
+            "name": "Unincorporated ACT",
+            "geometry": json.dumps(box(148.7, -35.9, 149.4, -35.1).__geo_interface__),
+        }])
+        with patch(
+            "mapmover.geometry_handlers._reference_graph_shape_owned_ids",
+            return_value={loc_id},
+        ), patch(
+            "mapmover.geometry_handlers.load_admin_spine_query_rows",
+        ) as query_mock, patch(
+            "mapmover.geometry_handlers.load_reference_graph_geometry",
+            return_value=graph_df,
+        ) as graph_mock:
+            payload = get_selection_geometries([loc_id])
+
+        self.assertEqual(payload["features"][0]["properties"]["loc_id"], loc_id)
+        query_mock.assert_not_called()
+        graph_mock.assert_called_once_with([loc_id])
+
     def test_load_geometry_rows_by_loc_ids_falls_back_to_level_loader_for_usa_admin1(self):
         level_df = pd.DataFrame(
             [

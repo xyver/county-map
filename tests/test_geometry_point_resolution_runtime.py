@@ -11,6 +11,7 @@ from mapmover.geometry_handlers import (
 )
 from mapmover.runtime.geometry_spine import geometry_spine_index_for_frame
 from mapmover.runtime.loc_id_resolution import resolve_point_to_loc_id_stack
+from mapmover.runtime.admin_spine_query import resolve_point as real_admin_spine_query_point
 
 
 class GeometryPointResolutionRuntimeTests(unittest.TestCase):
@@ -104,7 +105,11 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
     def test_california_block_point_resolves_through_admin5_spine(self):
         """Regression: audited CA Admin 5 must not stop at legacy geometry admin2."""
-        result = resolve_point_to_loc_id_stack(-116.710700, 34.320563, include_geometry=False)
+        with patch(
+            "mapmover.geometry_handlers.resolve_admin_spine_query_point",
+            side_effect=real_admin_spine_query_point,
+        ):
+            result = resolve_point_to_loc_id_stack(-116.710700, 34.320563, include_geometry=False)
 
         self.assertEqual(result["deepest_resolved_admin_level"], "admin_5")
         self.assertEqual(result["deepest_resolved_loc_id"], "USA-CA-071-010424-3-009")
@@ -113,7 +118,11 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         self.assertEqual(result["matches"]["admin_4"]["loc_id"], "USA-CA-071-010424-3")
 
     def test_australia_point_resolves_to_declared_admin6_spine(self):
-        result = resolve_point_to_loc_id_stack(139.827059, -27.604202, include_geometry=False)
+        with patch(
+            "mapmover.geometry_handlers.resolve_admin_spine_query_point",
+            side_effect=real_admin_spine_query_point,
+        ):
+            result = resolve_point_to_loc_id_stack(139.827059, -27.604202, include_geometry=False)
 
         self.assertEqual(result["deepest_resolved_admin_level"], "admin_6")
         self.assertEqual(
@@ -124,18 +133,25 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         self.assertEqual(result["matches"]["admin_6"]["name"], "40215189900")
         self.assertEqual(result["join_keys"]["admin_6_loc_id"], "AUS-SA-406-02-1141-07-0215189900")
 
-    def test_france_uses_global_geoboundaries_when_country_bank_is_absent(self):
-        """The global baseline remains usable, but only after country lookup."""
-        result = resolve_point_to_loc_id_stack(2.3522, 48.8566, include_geometry=False)
+    def test_france_uses_admitted_country_spine_before_global_fallback(self):
+        with patch(
+            "mapmover.geometry_handlers.resolve_admin_spine_query_point",
+            side_effect=real_admin_spine_query_point,
+        ):
+            result = resolve_point_to_loc_id_stack(2.3522, 48.8566, include_geometry=False)
 
         self.assertEqual(result["country"]["loc_id"], "FRA")
-        self.assertEqual(result["deepest_resolved_admin_level"], "admin_2")
-        self.assertTrue(result["deepest_resolved_loc_id"].startswith("FRA-G"))
+        self.assertEqual(result["deepest_resolved_admin_level"], "admin_4")
+        self.assertEqual(result["deepest_resolved_loc_id"], "FRA-11-75-1-056")
         self.assertEqual(result["join_keys"]["admin_0_loc_id"], "FRA")
-        self.assertEqual(result["join_keys"]["admin_2_loc_id"], result["deepest_resolved_loc_id"])
+        self.assertEqual(result["join_keys"]["admin_4_loc_id"], result["deepest_resolved_loc_id"])
 
     def test_canada_point_resolves_to_declared_admin5_spine(self):
-        result = resolve_point_to_loc_id_stack(-122.849, 49.191, include_geometry=False)
+        with patch(
+            "mapmover.geometry_handlers.resolve_admin_spine_query_point",
+            side_effect=real_admin_spine_query_point,
+        ):
+            result = resolve_point_to_loc_id_stack(-122.849, 49.191, include_geometry=False)
 
         self.assertEqual(result["deepest_resolved_admin_level"], "admin_5")
         self.assertEqual(
@@ -145,10 +161,14 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         self.assertEqual(result["matches"]["admin_2"]["loc_id"], "CAN-BC-5915")
 
     def test_canada_complete_point_chain_can_fetch_every_level_shape(self):
-        result = resolve_points_to_locations(
-            [{"lon": -122.849, "lat": 49.191}],
-            country_scope="CAN",
-        )[0]
+        with patch(
+            "mapmover.geometry_handlers.resolve_admin_spine_query_point",
+            side_effect=real_admin_spine_query_point,
+        ):
+            result = resolve_points_to_locations(
+                [{"lon": -122.849, "lat": 49.191}],
+                country_scope="CAN",
+            )[0]
         loc_ids = [row["loc_id"] for row in result["stack"]]
 
         metadata = get_selection_geometry_metadata(loc_ids)
@@ -253,6 +273,37 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         self.assertEqual(metadata[0]["loc_id"], "USA-Z-57718")
         query_mock.assert_not_called()
 
+    def test_graph_shape_ownership_beats_deep_admin_prefix_heuristic(self):
+        import pandas as pd
+
+        loc_id = "AUS-ACT-801-LOCALGOV-89399"
+        reference_row = pd.DataFrame([{
+            "loc_id": loc_id,
+            "name": "Unincorporated ACT",
+            "has_polygon": True,
+            "bbox_min_lon": 148.7,
+            "bbox_min_lat": -35.9,
+            "bbox_max_lon": 149.4,
+            "bbox_max_lat": -35.1,
+        }])
+        with (
+            patch(
+                "mapmover.geometry_handlers._reference_graph_shape_owned_ids",
+                return_value={loc_id},
+            ),
+            patch("mapmover.geometry_handlers.load_admin_spine_query_rows") as query_mock,
+            patch(
+                "mapmover.geometry_handlers.load_reference_graph_geometry",
+                return_value=reference_row,
+            ) as graph_mock,
+        ):
+            metadata = get_selection_geometry_metadata([loc_id])
+
+        self.assertEqual(metadata[0]["loc_id"], loc_id)
+        self.assertTrue(metadata[0]["has_polygon"])
+        query_mock.assert_not_called()
+        graph_mock.assert_called_once()
+
     def test_admin_loc_id_info_uses_query_layout_before_reference_graph(self):
         metadata = {
             "loc_id": "USA-SD-019-967600-1-023",
@@ -291,15 +342,17 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         self.assertEqual(info["memberships"], [])
         ancestor_mock.assert_not_called()
 
-    def test_brazil_bairro_point_resolves_to_declared_admin5_spine(self):
-        result = resolve_point_to_loc_id_stack(-48.12994234942419, -22.793495497153657, include_geometry=False)
+    def test_brazil_bairro_remains_sidechain_below_declared_admin4_spine(self):
+        with patch(
+            "mapmover.geometry_handlers.resolve_admin_spine_query_point",
+            side_effect=real_admin_spine_query_point,
+        ):
+            result = resolve_point_to_loc_id_stack(-43.1729, -22.9068, include_geometry=False)
 
-        self.assertEqual(result["deepest_resolved_admin_level"], "admin_5")
-        self.assertEqual(
-            result["deepest_resolved_loc_id"],
-            "BRA-SP-3502309-05-00-003",
-        )
-        self.assertEqual(result["matches"]["admin_5"]["name"], "Jardim Nova Anhembi")
+        self.assertEqual(result["deepest_resolved_admin_level"], "admin_4")
+        self.assertEqual(result["deepest_resolved_loc_id"], "BRA-RJ-3304557-05-07")
+        self.assertEqual(result["matches"]["admin_2"]["loc_id"], "BRA-RJ-3304557")
+        self.assertNotIn("admin_5", result["matches"])
 
     def test_resolve_point_to_location_prefers_admin2_without_series_truthiness(self):
         class _Frame:

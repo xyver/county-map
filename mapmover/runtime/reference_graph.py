@@ -24,6 +24,8 @@ from .geometry_catalog import load_geometry_catalog
 
 
 ENV_NAME = "GEOGRAPHY_REFERENCE_GRAPH_ROOT"
+PUBLIC_ALIAS_TYPE = "preferred_public_loc_id"
+PUBLIC_REFERENCE_PREFIX = "daedalmap.public."
 
 #: Every country publishes its graph in the same place and the same shape.
 #: There is one format - a hash-pinned partition index - so this module never
@@ -559,6 +561,123 @@ def resolve_alias(
         )
         columns = [item[0] for item in cursor.description]
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def resolve_public_loc_id(loc_id: str) -> dict[str, Any]:
+    """Resolve one public loc_id alias to its canonical graph identity.
+
+    Canonical identities always win.  Public aliases are deliberately narrower
+    than the graph's general alias surface: only ``preferred_public_loc_id``
+    rows in a ``daedalmap.public.*`` reference system may stand in for a
+    loc_id.  More than one distinct target fails closed instead of choosing a
+    target by partition or row order.
+    """
+    requested = str(loc_id or "").strip().upper()
+    base = {
+        "requested_loc_id": requested,
+        "loc_id": requested,
+        "resolved_from_public_alias": False,
+    }
+    if not requested or not reference_graph_available():
+        return {"ok": True, "status": "unchanged", **base}
+    if identity(requested):
+        return {"ok": True, "status": "canonical", **base}
+
+    roots = graph_roots_for_loc_id(requested)
+    source = _table_source_for_roots("aliases", roots)
+    if not source:
+        return {"ok": True, "status": "unchanged", **base}
+    connection = _connection()
+    try:
+        cursor = connection.execute(
+            f"""SELECT * FROM read_parquet({source}, union_by_name=True)
+                WHERE upper(external_id) = ?
+                  AND lower(alias_type) = ?
+                  AND lower(reference_system) LIKE ?
+                ORDER BY reference_system, loc_id""",
+            [requested, PUBLIC_ALIAS_TYPE, f"{PUBLIC_REFERENCE_PREFIX}%"],
+        )
+        columns = [item[0] for item in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        connection.close()
+    if not rows:
+        return {"ok": True, "status": "unchanged", **base}
+
+    targets = sorted({str(row.get("loc_id") or "").strip() for row in rows if str(row.get("loc_id") or "").strip()})
+    systems = sorted({str(row.get("reference_system") or "").strip() for row in rows if str(row.get("reference_system") or "").strip()})
+    if len(targets) != 1:
+        return {
+            "ok": False,
+            "status": "ambiguous",
+            **base,
+            "loc_id": None,
+            "candidate_loc_ids": targets,
+            "reference_systems": systems,
+            "error": {
+                "code": "ambiguous_public_loc_id",
+                "message": "preferred public loc_id resolves to more than one canonical identity",
+            },
+        }
+    target = targets[0]
+    if not identity(target):
+        return {
+            "ok": False,
+            "status": "invalid_target",
+            **base,
+            "loc_id": None,
+            "candidate_loc_ids": targets,
+            "reference_systems": systems,
+            "error": {
+                "code": "invalid_public_loc_id_target",
+                "message": "preferred public loc_id points to an identity absent from the active graph",
+            },
+        }
+    return {
+        "ok": True,
+        "status": "resolved",
+        **base,
+        "loc_id": target,
+        "resolved_from_public_alias": True,
+        "public_alias": requested,
+        "reference_system": systems[0] if len(systems) == 1 else None,
+        "reference_systems": systems,
+    }
+
+
+def public_alias_reference_systems(*, iso3: str | None = None) -> list[dict[str, Any]]:
+    """Describe callable preferred-public alias systems in active graphs."""
+    roots_by_country = reference_graph_roots()
+    country = str(iso3 or "").strip().upper()
+    roots = [roots_by_country[country]] if country in roots_by_country else ([] if country else list(roots_by_country.values()))
+    source = _table_source_for_roots("aliases", roots)
+    if not source:
+        return []
+    connection = _connection()
+    try:
+        cursor = connection.execute(
+            f"""SELECT reference_system,
+                       count(*) AS alias_count,
+                       count(DISTINCT external_id) AS public_id_count,
+                       count(DISTINCT loc_id) AS identity_count
+                FROM read_parquet({source}, union_by_name=True)
+                WHERE lower(alias_type) = ?
+                  AND lower(reference_system) LIKE ?
+                GROUP BY reference_system
+                ORDER BY reference_system""",
+            [PUBLIC_ALIAS_TYPE, f"{PUBLIC_REFERENCE_PREFIX}%"],
+        )
+        return [
+            {
+                "system": row[0],
+                "alias_count": int(row[1]),
+                "public_id_count": int(row[2]),
+                "identity_count": int(row[3]),
+            }
+            for row in cursor.fetchall()
+        ]
     finally:
         connection.close()
 

@@ -80,11 +80,6 @@ _country_parquet_waiters = {}  # key -> Event for concurrent waiters
 _country_bounds_cache = None
 
 _GEOMETRY_CACHE_MAX_BYTES = max(32 * 1024 * 1024, int(float(os.environ.get("GEOMETRY_CACHE_MAX_MB", "256")) * 1024 * 1024))
-_LOCAL_PARQUET_PUSHDOWN_THRESHOLD_BYTES = max(
-    64 * 1024 * 1024,
-    int(float(os.environ.get("LOCAL_PARQUET_PUSHDOWN_THRESHOLD_MB", "384")) * 1024 * 1024),
-)
-
 GEOMETRY_INDEX_COLUMNS = [
     "loc_id",
     "local_loc_id",
@@ -441,10 +436,13 @@ def load_country_parquet_viewport(iso3: str, admin_level: int | None, bbox: tupl
         # adopted AUS spine whose first mixed-level row group is ~577 MB
         # uncompressed: a bounded three-row point query otherwise requests a
         # 512 MB allocation under the runtime's 488 MB DuckDB ceiling.
-        use_local_pushdown = parquet_file.exists() and (
-            _prefer_local_geometry_reads()
-            or parquet_file.stat().st_size >= _LOCAL_PARQUET_PUSHDOWN_THRESHOLD_BYTES
-        )
+        # Always use Arrow for a real local file. New authority releases use
+        # GeoParquet's native GEOMETRY logical type; current DuckDB can query
+        # it, but converting that typed column directly to a NumPy-backed frame
+        # raises ``Unsupported type GEOMETRY``. Arrow preserves the geometry
+        # payload and predicate pushdown for both small and large local banks.
+        # DuckDB remains the bounded path for cloud URIs/non-local sources.
+        use_local_pushdown = parquet_file.exists()
         if use_local_pushdown:
             filters = []
             if admin_level is not None:
@@ -2327,8 +2325,13 @@ def get_location_info(loc_id: str, *, include_memberships: bool = True):
                 include_memberships=include_memberships,
             )
 
-    family = _geometry_family_for_loc_id(loc_id)
     graph_info = _reference_graph_location_info(loc_id)
+    if graph_info and not str(graph_info.get("family") or "").startswith("admin"):
+        # A real admitted admin query-layout row wins first. On an authoritative
+        # admin miss, the graph family then rescues sidechain IDs whose stable
+        # code components happen to resemble a deep admin ID.
+        return graph_info
+    family = _geometry_family_for_loc_id(loc_id)
     if graph_info and not str(family or "").startswith("admin"):
         # Reference-sidechain metadata already lives in the graph identity row.
         # Avoid opening a potentially huge geometry partition merely to answer
@@ -3498,6 +3501,7 @@ def get_selection_geometries(loc_ids: list):
 
     features = []
     requested_ids = [str(loc_id).strip() for loc_id in loc_ids if str(loc_id).strip()]
+    graph_shape_ids = _reference_graph_shape_owned_ids(requested_ids)
 
     # The query layout owns both directions of the point -> loc_id -> shape
     # contract. Fetch these rows before graph/legacy routing so get_geometry
@@ -3505,6 +3509,8 @@ def get_selection_geometries(loc_ids: list):
     query_layout_ids: set[str] = set()
     by_iso3: dict[str, list[str]] = {}
     for loc_id in requested_ids:
+        if loc_id in graph_shape_ids:
+            continue
         if not str(classify_loc_id_family(loc_id) or "").startswith("admin"):
             continue
         by_iso3.setdefault(loc_id.split("-", 1)[0].upper(), []).append(loc_id)
@@ -3655,6 +3661,32 @@ def _geometry_metadata_row(row) -> dict:
     }
 
 
+def _reference_graph_shape_owned_ids(loc_ids: list[str]) -> set[str]:
+    """Return IDs whose active graph identity owns an exact shape bank.
+
+    Sidechain IDs intentionally reuse stable authority-code components and can
+    therefore look like deep administrative IDs to the legacy prefix parser.
+    The integrated graph is the semantic authority: an explicit ``has_shape``
+    plus ``geometry_bank`` declaration must win before an admitted admin query
+    layout claims a syntactic lookalike as an authoritative miss.
+    """
+    requested = [str(loc_id).strip() for loc_id in loc_ids if str(loc_id).strip()]
+    if not requested:
+        return set()
+    try:
+        from .runtime.reference_graph import identities
+
+        return {
+            str(row.get("loc_id"))
+            for row in identities(requested)
+            if row.get("has_shape") is True and str(row.get("geometry_bank") or "").strip()
+        }
+    except Exception:
+        # Graph discovery is an optional fast semantic discriminator here. The
+        # existing bounded admin and legacy routing remains the safe fallback.
+        return set()
+
+
 def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
     """
     Get exact loc_id geometry metadata for lightweight availability checks.
@@ -3670,6 +3702,7 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
     rows: list[dict] = []
     requested_ids = [str(loc_id).strip() for loc_id in loc_ids if str(loc_id).strip()]
     requested_set = set(requested_ids)
+    graph_shape_ids = _reference_graph_shape_owned_ids(requested_ids)
 
     # Query-layout admin IDs should use the same bounded country/Admin1 shard
     # path as polygon retrieval. This avoids a broad reference-graph or legacy
@@ -3683,6 +3716,8 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
     ]
     by_iso3: dict[str, list[str]] = {}
     for loc_id in requested_ids:
+        if loc_id in graph_shape_ids:
+            continue
         if not str(classify_loc_id_family(loc_id) or "").startswith("admin"):
             continue
         by_iso3.setdefault(loc_id.split("-", 1)[0].upper(), []).append(loc_id)

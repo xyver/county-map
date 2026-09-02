@@ -2656,22 +2656,48 @@ async def _execute_loc_id_info_tool(request: Request, arguments: dict[str, Any],
 
 
 def _loc_id_info_item(loc_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    requested_loc_id = str(loc_id or "").strip().upper()
+    try:
+        from mapmover.runtime.reference_exchange import resolve_loc_id_input
+
+        public_resolution = resolve_loc_id_input(requested_loc_id)
+    except Exception:
+        public_resolution = {
+            "ok": True,
+            "requested_loc_id": requested_loc_id,
+            "loc_id": requested_loc_id,
+            "resolved_from_public_alias": False,
+        }
+    if not public_resolution.get("ok"):
+        result = {
+            "loc_id": requested_loc_id,
+            "requested_loc_id": requested_loc_id,
+            "canonical_loc_id": None,
+            "error": public_resolution.get("error") or {
+                "code": "public_loc_id_resolution_failed",
+                "message": "preferred public loc_id could not be resolved safely",
+            },
+        }
+        if public_resolution.get("candidate_loc_ids"):
+            result["candidate_loc_ids"] = public_resolution.get("candidate_loc_ids")
+        return result
+    canonical_loc_id = str(public_resolution.get("loc_id") or requested_loc_id)
     try:
         from mapmover.geometry_handlers import get_location_info
 
         # MCP returns hierarchy only when explicitly requested and never exposes
         # popup memberships. Avoid a second ancestor-metadata read whose result
         # would otherwise be discarded from the response.
-        info = get_location_info(loc_id, include_memberships=False)
+        info = get_location_info(canonical_loc_id, include_memberships=False)
     except Exception as exc:
-        return {"loc_id": loc_id, "error": {"code": "info_failed", "message": str(exc)}}
+        return {"loc_id": canonical_loc_id, "error": {"code": "info_failed", "message": str(exc)}}
     if not isinstance(info, dict) or info.get("error"):
         return {
-            "loc_id": loc_id,
-            "error": {"code": "not_found", "message": str((info or {}).get("error") or f"no record found for loc_id '{loc_id}'")},
+            "loc_id": canonical_loc_id,
+            "error": {"code": "not_found", "message": str((info or {}).get("error") or f"no record found for loc_id '{canonical_loc_id}'")},
         }
     result = {
-        "loc_id": info.get("loc_id") or loc_id,
+        "loc_id": info.get("loc_id") or canonical_loc_id,
         "name": info.get("name"),
         "admin_level": info.get("admin_level"),
         "parent_id": info.get("parent_id"),
@@ -2693,6 +2719,13 @@ def _loc_id_info_item(loc_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "children_by_level": _parse_children_by_level(info.get("children_by_level")),
         "descendants_count": info.get("descendants_count"),
     }
+    if public_resolution.get("resolved_from_public_alias"):
+        result.update({
+            "requested_loc_id": requested_loc_id,
+            "resolved_from_public_alias": True,
+            "public_alias": public_resolution.get("public_alias") or requested_loc_id,
+            "public_alias_reference_system": public_resolution.get("reference_system"),
+        })
     if bool(payload.get("include_hierarchy")):
         try:
             ancestors: list[str] = []
