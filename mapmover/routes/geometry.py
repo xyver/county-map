@@ -79,12 +79,7 @@ def _point_lookup_paid_batch_limit() -> int:
 
 
 def _caller_included_point_limit(caller_identity, *, free_limit: int, paid_limit: int) -> int:
-    """Included point allowance for this caller, by access tier.
-
-    Anonymous stays on the free limit, a verified account gets the account
-    limit, and a paid plan gets the full paid ceiling. Payment beyond that is
-    handled by settlement rather than by widening the included allowance.
-    """
+    """Included point allowance for this caller, clamped between free and paid."""
     lane = caller_identity.included_item_lane
     if lane == "paid":
         return paid_limit

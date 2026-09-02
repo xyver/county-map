@@ -16,18 +16,11 @@ Three product rules this file encodes:
    upstream license forbids paid hosted service, the tool stays free no matter
    what is authored here. See ``licensing_permits_paid_bulk``.
 
-**Entitlement limits, not safety ceilings.** Every limit in this file is an
-entitlement: it says how much of a tool a caller has *earned* the right to use,
-and a caller moves up the ladder by signing up or by paying. That is a
-different class of control from the safety ceilings that stop one request from
-hurting the server - process admission, concurrency, request-body size, read
-bytes and partitions, DuckDB memory, and wall time. Safety ceilings are
-non-bypassable and no plan, credit balance, or subscription may raise them.
-Keep the two classes separate: money moves an entitlement, never a ceiling.
+These are entitlement limits, not safety ceilings. Safety ceilings live in the
+runtime read/admission path; see ``docs/caps_and_limits.md``.
 
-The three entitlement lanes are ``free`` (anonymous), ``account`` (verified,
-no paid plan), and ``paid`` (paid plan or settled call). They map one-to-one
-onto ``CallerIdentity.access_tier``.
+Lanes are ``free``, ``account``, and ``paid``, matching
+``CallerIdentity.access_tier``.
 
 To change a limit: edit ``free_item_limit`` / ``account_item_limit`` /
 ``paid_item_limit`` here.
@@ -336,19 +329,16 @@ def tool_paid_item_limit(tool_name: str) -> int | None:
     return int(value) if isinstance(value, int) else None
 
 
-# How much larger an account allowance is than the anonymous one when a tool
-# does not author ``account_item_limit`` explicitly. Signing up should be worth
-# a visible jump without handing over the paid ceiling, which is the thing a
-# plan is meant to sell.
+# Fallback multiple over the free limit when a tool does not author
+# ``account_item_limit``.
 ACCOUNT_ITEM_LIMIT_MULTIPLIER = 10
 
 
 def tool_account_item_limit(tool_name: str) -> int | None:
-    """Middle-rung item limit for a verified account with no paid plan.
+    """Account-lane item limit.
 
-    Authored ``account_item_limit`` wins. Otherwise this is the free limit
-    scaled by ``ACCOUNT_ITEM_LIMIT_MULTIPLIER`` and clamped to the paid limit,
-    so a tool can never hand an unpaid account more than a paying one.
+    Authored ``account_item_limit`` wins; otherwise the free limit scaled by
+    ``ACCOUNT_ITEM_LIMIT_MULTIPLIER``, clamped to the paid limit.
     """
     authored = tool_profile(tool_name).get("account_item_limit")
     if isinstance(authored, int):

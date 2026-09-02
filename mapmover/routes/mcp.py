@@ -518,10 +518,7 @@ async def _authorize_paid_batch_tool(
             loc_id_count=item_count,
         ), free_limit, paid_limit
     caller = request_caller_identity(request, ip_hash=hash_ip_for_analytics(get_client_ip(request)))
-    # Included allowance first, settlement second. Before the tiered ladder any
-    # verified account short-circuited here, so an account holder could never
-    # reach the paid path at all: the size product was given away at signup and
-    # settlement only ever served anonymous wallet callers.
+    # Included allowance first, then settlement for anything above it.
     included_limit = _caller_included_item_limit(
         tool_name, caller, free_limit=free_limit, paid_limit=paid_limit
     )
@@ -690,12 +687,7 @@ def _point_lookup_paid_batch_limit(free_limit: int) -> int:
 
 
 def _caller_included_item_limit(tool_name: str, caller_identity, *, free_limit: int, paid_limit: int) -> int:
-    """Included item allowance for this caller, by access tier.
-
-    One ladder: anonymous keeps the free limit, a verified account gets the
-    account limit, a paid plan gets the paid ceiling. Anything above the
-    returned value falls through to settlement instead of being granted.
-    """
+    """Included item allowance for this caller, clamped between free and paid."""
     lane = caller_identity.included_item_lane
     if lane == "paid":
         return paid_limit
@@ -750,15 +742,9 @@ def _tool_env_suffix(tool_name: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in str(tool_name or "").upper()).strip("_")
 
 
-# Access tier -> rate tier. Speed reads the same ladder as size, so a caller can
-# never be paid for one axis and anonymous for the other. Billing that sets
-# plan_id lives on the account/control plane (Stripe); the runtime only reads
-# the verified plan. This is generic - any rate-limited free tool inherits the
-# tiering, not a geography-specific path.
-#
-# "plus" here is a rate-tier name, not a plan id. It is the existing env
-# contract (MCP_TOOL_RATE_LIMIT_PLUS) and is deliberately kept; which plans
-# reach it is decided by PAID_PLAN_IDS in caller_identity.
+# Access tier -> rate tier. "plus" is a rate-tier name, not a plan id; it is the
+# existing MCP_TOOL_RATE_LIMIT_PLUS env contract. Which plans reach it is
+# decided by PAID_PLAN_IDS in caller_identity.
 TOOL_RATE_TIER_BY_ACCESS_TIER: dict[str, str] = {
     TIER_ANONYMOUS: "free",
     TIER_ACCOUNT: "account",
@@ -805,8 +791,6 @@ def _tool_rate_limit_for_tier(tool_name: str, tier: str) -> tuple[int, int]:
             default_window_seconds=window_seconds,
         )
     if tier == "account":
-        # Middle rung: signing up is worth real headroom on speed as well as
-        # size, while leaving the plus tier something to sell.
         account_limit = (
             _parse_env_int_optional(f"MCP_TOOL_RATE_LIMIT_{suffix}_ACCOUNT")
             or _parse_env_int("MCP_TOOL_RATE_LIMIT_ACCOUNT", max(free_limit, 60))

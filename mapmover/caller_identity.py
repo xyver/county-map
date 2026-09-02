@@ -44,29 +44,14 @@ KIND_UNKNOWN = "unknown"
 CONFIDENCE_VERIFIED = "verified"
 CONFIDENCE_WEAK = "weak"
 
-# Access tiers, weakest first. One ladder, read by both throughput axes: the
-# per-call item limit and the per-window rate limit. Before this existed, size
-# keyed off "is this an account?" and speed keyed off plan_id, so an account
-# that had never paid received the full paid item ceiling while still being
-# rate-limited as an anonymous caller.
-#
-# The ladder is deliberately three rungs:
-#   anonymous - an eternal free taste, capped on size and speed
-#   account   - a larger allowance, the reason to sign up before a big job
-#   paid      - a plan raises both ceilings and unlocks metered overage
+# Access tiers, weakest first. Read by both the per-call item limit and the
+# per-window rate limit so the two cannot disagree about one caller.
 TIER_ANONYMOUS = "anonymous"
 TIER_ACCOUNT = "account"
 TIER_PAID = "paid"
 
-# Plans that resolve to the paid tier. Billing owns which plan a user has; the
-# runtime only reads it. "master" is the internal/admin plan and is included so
-# operator traffic is never throttled below a customer.
-#
-# These ids must exist in the `plans` table. The set is a compatibility default
-# and should be replaced by a `plans.access_tier` column so the ladder is data
-# rather than code; the previous hardcoded map had drifted to name a "plus"
-# plan that does not exist, which silently demoted real plans to the account
-# tier.
+# Must match ids in the `plans` table. Compatibility default for
+# `plans.access_tier`, which is the authority.
 PAID_PLAN_IDS: frozenset[str] = frozenset({"pro", "enterprise", "master"})
 
 # Cookie carrying a server-issued anonymous session id. High entropy so it
@@ -140,13 +125,7 @@ class CallerIdentity:
 
     @property
     def access_tier(self) -> str:
-        """The one ladder rung this caller sits on.
-
-        Both the item limit and the rate limit read this, so a caller can never
-        be treated as paid for size and anonymous for speed at the same time.
-        An account only reaches ``paid`` by holding a paid plan; signing up is
-        worth a larger allowance, not the whole paid ceiling.
-        """
+        """Ladder rung for this caller: anonymous, account, or paid."""
         if not self.is_verified or not self.auth_user_id:
             return TIER_ANONYMOUS
         if str(self.plan_id or "").strip().lower() in PAID_PLAN_IDS:
@@ -155,12 +134,10 @@ class CallerIdentity:
 
     @property
     def included_item_lane(self) -> str:
-        """Which authored item limit this caller's included allowance resolves to.
+        """Item lane in ``tool_access_shared``: free, account, or paid.
 
-        ``free`` / ``account`` / ``paid`` are the lanes in ``tool_access_shared``.
-        A caller with no included allowance at all - notably an API key lacking
-        ``geometry:bulk`` - stays on the free lane regardless of its tier, so a
-        narrow read key never becomes bulk-compute authority.
+        A caller with no included allowance stays on ``free`` whatever its tier,
+        which is how an API key without ``geometry:bulk`` is held back.
         """
         if not self.can_use_included_bulk:
             return "free"
