@@ -22,6 +22,9 @@ from mapmover.caller_identity import (
     KIND_API_KEY,
     KIND_IP,
     KIND_UNKNOWN,
+    TIER_ACCOUNT,
+    TIER_ANONYMOUS,
+    TIER_PAID,
     CallerIdentity,
     issue_anon_session_id,
     ensure_anon_session,
@@ -166,6 +169,59 @@ class SpendAuthorisationTests(unittest.TestCase):
             with self.subTest(kind=kind, confidence=confidence):
                 identity = CallerIdentity(kind, "x", confidence, auth_user_id=user_id)
                 self.assertEqual(identity.can_spend_credits, expected)
+
+
+class AccessTierTests(unittest.TestCase):
+    """One ladder for both throughput axes.
+
+    Before this existed, size keyed off "is this an account?" and speed keyed
+    off plan_id, so an account that had never paid got the full paid item
+    ceiling while still being rate-limited as anonymous.
+    """
+
+    def test_tier_by_caller(self) -> None:
+        for label, identity, tier in [
+            ("anonymous session", CallerIdentity(KIND_ANON_SESSION, "a", CONFIDENCE_WEAK), TIER_ANONYMOUS),
+            ("ip", CallerIdentity(KIND_IP, "h", CONFIDENCE_WEAK), TIER_ANONYMOUS),
+            ("account", CallerIdentity(KIND_ACCOUNT, "u1", CONFIDENCE_VERIFIED, auth_user_id="u1"), TIER_ACCOUNT),
+            (
+                "account on a free plan",
+                CallerIdentity(KIND_ACCOUNT, "u1", CONFIDENCE_VERIFIED, auth_user_id="u1", plan_id="free"),
+                TIER_ACCOUNT,
+            ),
+            (
+                "account on a paid plan",
+                CallerIdentity(KIND_ACCOUNT, "u2", CONFIDENCE_VERIFIED, auth_user_id="u2", plan_id="plus"),
+                TIER_PAID,
+            ),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(identity.access_tier, tier)
+
+    def test_weak_identity_with_paid_plan_stays_anonymous(self) -> None:
+        """A plan claim on an unverified identity must not buy throughput."""
+        identity = CallerIdentity(KIND_IP, "h", CONFIDENCE_WEAK, auth_user_id="u1", plan_id="pro")
+        self.assertEqual(identity.access_tier, TIER_ANONYMOUS)
+        self.assertEqual(identity.included_item_lane, "free")
+
+    def test_signing_up_does_not_grant_the_paid_ceiling(self) -> None:
+        account = CallerIdentity(KIND_ACCOUNT, "u1", CONFIDENCE_VERIFIED, auth_user_id="u1")
+        paid = CallerIdentity(KIND_ACCOUNT, "u2", CONFIDENCE_VERIFIED, auth_user_id="u2", plan_id="plus")
+        self.assertEqual(account.included_item_lane, "account")
+        self.assertEqual(paid.included_item_lane, "paid")
+
+    def test_api_key_without_bulk_scope_has_no_included_lane(self) -> None:
+        """A narrow read key must not become bulk-compute authority."""
+        without = CallerIdentity(KIND_API_KEY, "k", CONFIDENCE_VERIFIED, auth_user_id="u3", scopes=())
+        with_scope = CallerIdentity(
+            KIND_API_KEY, "k", CONFIDENCE_VERIFIED, auth_user_id="u3", scopes=("geometry:bulk",)
+        )
+        self.assertEqual(without.included_item_lane, "free")
+        self.assertEqual(with_scope.included_item_lane, "account")
+
+    def test_tier_is_reported_to_analytics(self) -> None:
+        identity = CallerIdentity(KIND_ACCOUNT, "u1", CONFIDENCE_VERIFIED, auth_user_id="u1", plan_id="pro")
+        self.assertEqual(identity.as_analytics_fields()["access_tier"], TIER_PAID)
 
 
 if __name__ == "__main__":

@@ -42,7 +42,13 @@ from mapmover.api_query_commercial import (
     settle_commercial_access,
     settlement_headers,
 )
-from mapmover.caller_identity import request_caller_identity
+from mapmover.caller_identity import (
+    PAID_PLAN_IDS,
+    TIER_ACCOUNT,
+    TIER_ANONYMOUS,
+    TIER_PAID,
+    request_caller_identity,
+)
 from mapmover.routes.disasters.related import (
     get_disaster_link_chain_for_exact_event,
     get_disaster_links_for_exact_event,
@@ -512,9 +518,15 @@ async def _authorize_paid_batch_tool(
             loc_id_count=item_count,
         ), free_limit, paid_limit
     caller = request_caller_identity(request, ip_hash=hash_ip_for_analytics(get_client_ip(request)))
+    # Included allowance first, settlement second. Before the tiered ladder any
+    # verified account short-circuited here, so an account holder could never
+    # reach the paid path at all: the size product was given away at signup and
+    # settlement only ever served anonymous wallet callers.
+    included_limit = _caller_included_item_limit(
+        tool_name, caller, free_limit=free_limit, paid_limit=paid_limit
+    )
     if (
-        item_count <= free_limit
-        or caller.can_use_included_bulk
+        item_count <= included_limit
         or trusted_token is not None
         or is_local_loopback_request(request)
     ):
@@ -677,6 +689,20 @@ def _point_lookup_paid_batch_limit(free_limit: int) -> int:
     return _tool_paid_batch_limit("resolve_point", free_limit)
 
 
+def _caller_included_item_limit(tool_name: str, caller_identity, *, free_limit: int, paid_limit: int) -> int:
+    """Included item allowance for this caller, by access tier.
+
+    One ladder: anonymous keeps the free limit, a verified account gets the
+    account limit, a paid plan gets the paid ceiling. Anything above the
+    returned value falls through to settlement instead of being granted.
+    """
+    lane = caller_identity.included_item_lane
+    if lane == "paid":
+        return paid_limit
+    resolved = tool_effective_item_limit(tool_name, lane=lane, default=free_limit)
+    return max(free_limit, min(int(resolved or free_limit), paid_limit))
+
+
 def _point_bulk_shape_error(
     *, point_count: int, country_scope: str | None, target_admin_level: int | None,
     bulk_preset: str | None = None, threshold: int
@@ -724,14 +750,15 @@ def _tool_env_suffix(tool_name: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in str(tool_name or "").upper()).strip("_")
 
 
-# Verified account plan_id -> rate tier. Anonymous callers and free plans map to
-# the default free tier; a paid subscription plan raises the limit. Billing that
-# sets plan_id lives on the account/control plane (Stripe); the runtime only
-# reads the verified plan. This is generic - any rate-limited free tool inherits
-# the tiering, not a geography-specific path.
-TOOL_RATE_TIER_BY_PLAN: dict[str, str] = {
-    "plus": "plus",
-    "pro": "plus",
+# Access tier -> rate tier. Speed reads the same ladder as size, so a caller can
+# never be paid for one axis and anonymous for the other. Billing that sets
+# plan_id lives on the account/control plane (Stripe); the runtime only reads
+# the verified plan. This is generic - any rate-limited free tool inherits the
+# tiering, not a geography-specific path.
+TOOL_RATE_TIER_BY_ACCESS_TIER: dict[str, str] = {
+    TIER_ANONYMOUS: "free",
+    TIER_ACCOUNT: "account",
+    TIER_PAID: "plus",
 }
 
 
@@ -741,12 +768,15 @@ def _resolve_caller_rate_tier(request: Request) -> str:
     user = getattr(request.state, "authenticated_user_context", None)
     if not isinstance(user, dict):
         return "free"
+    plan_id = ""
     for source in (user.get("app_metadata"), user.get("user_metadata"), user):
-        if isinstance(source, dict):
-            plan_id = str(source.get("plan_id") or "").strip().lower()
-            if plan_id:
-                return TOOL_RATE_TIER_BY_PLAN.get(plan_id, "free")
-    return "free"
+        if isinstance(source, dict) and source.get("plan_id"):
+            plan_id = str(source["plan_id"]).strip().lower()
+            break
+    if not user.get("id"):
+        return "free"
+    access_tier = TIER_PAID if plan_id in PAID_PLAN_IDS else TIER_ACCOUNT
+    return TOOL_RATE_TIER_BY_ACCESS_TIER.get(access_tier, "free")
 
 
 def _tool_rate_limit_for_tier(tool_name: str, tier: str) -> tuple[int, int]:
@@ -768,6 +798,19 @@ def _tool_rate_limit_for_tier(tool_name: str, tier: str) -> tuple[int, int]:
             tool_name,
             tier,
             default_limit=plus_limit,
+            default_window_seconds=window_seconds,
+        )
+    if tier == "account":
+        # Middle rung: signing up is worth real headroom on speed as well as
+        # size, while leaving the plus tier something to sell.
+        account_limit = (
+            _parse_env_int_optional(f"MCP_TOOL_RATE_LIMIT_{suffix}_ACCOUNT")
+            or _parse_env_int("MCP_TOOL_RATE_LIMIT_ACCOUNT", max(free_limit, 60))
+        )
+        return tool_rate_limit(
+            tool_name,
+            tier,
+            default_limit=account_limit,
             default_window_seconds=window_seconds,
         )
     return tool_rate_limit(
@@ -1948,7 +1991,11 @@ async def _execute_resolve_point_tool(request: Request, arguments: dict[str, Any
         launch_free_bulk = bool(
             tool_access.get("allow") and tool_access.get("access_lane") == "launch_free"
         )
-        included_limit = paid_limit if caller_identity.can_use_included_bulk or launch_free_bulk else limit
+        included_limit = (
+            paid_limit
+            if launch_free_bulk
+            else _caller_included_item_limit("resolve_point", caller_identity, free_limit=limit, paid_limit=paid_limit)
+        )
         shape_error = _point_bulk_shape_error(
             point_count=len(points), country_scope=country_scope,
             target_admin_level=target_admin_level, bulk_preset=bulk_preset, threshold=limit,
@@ -2302,6 +2349,7 @@ async def _execute_resolve_point_tool(request: Request, arguments: dict[str, Any
                 "paid_batch_limit": paid_limit,
                 "included_batch_limit": included_limit,
                 "included_account_bulk": caller_identity.can_use_included_bulk,
+                "access_tier": caller_identity.access_tier,
                 "access_lane": _request_access_lane(request, trusted_token),
                 "artifact_token_id": trusted_token_id,
                 "target_admin_level": f"admin_{target_admin_level}" if target_admin_level is not None else "deepest",

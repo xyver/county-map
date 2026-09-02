@@ -10,6 +10,7 @@ from unittest import mock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from mapmover.caller_identity import CONFIDENCE_VERIFIED, KIND_ACCOUNT, CallerIdentity
 from mapmover.runtime.reference_exchange import get_geometry_availability, get_geometry_references
 from mapmover.routes.mcp import (
     _jsonrpc_response,
@@ -319,7 +320,9 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
                 for point in points
             ]
 
-        identity = mock.Mock(can_use_included_bulk=True, auth_user_id="user-1")
+        # A real identity, not a Mock: the included allowance now depends on the
+        # caller's access tier, so a Mock would silently invent a lane.
+        identity = CallerIdentity(KIND_ACCOUNT, "user-1", CONFIDENCE_VERIFIED, auth_user_id="user-1")
         with (
             mock.patch("mapmover.routes.mcp.request_caller_identity", return_value=identity),
             mock.patch("mapmover.routes.mcp._tool_paid_bulk_enforced", return_value=False),
@@ -343,7 +346,9 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
                 for _ in points
             ]
 
-        identity = mock.Mock(can_use_included_bulk=True, auth_user_id="user-1")
+        # A real identity, not a Mock: the included allowance now depends on the
+        # caller's access tier, so a Mock would silently invent a lane.
+        identity = CallerIdentity(KIND_ACCOUNT, "user-1", CONFIDENCE_VERIFIED, auth_user_id="user-1")
         with (
             mock.patch("mapmover.routes.mcp.request_caller_identity", return_value=identity),
             mock.patch("mapmover.geometry_handlers.resolve_points_to_locations", side_effect=fake_resolve) as resolver_mock,

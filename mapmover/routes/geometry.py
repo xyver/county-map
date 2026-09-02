@@ -78,6 +78,20 @@ def _point_lookup_paid_batch_limit() -> int:
     return max(free_limit, paid_limit)
 
 
+def _caller_included_point_limit(caller_identity, *, free_limit: int, paid_limit: int) -> int:
+    """Included point allowance for this caller, by access tier.
+
+    Anonymous stays on the free limit, a verified account gets the account
+    limit, and a paid plan gets the full paid ceiling. Payment beyond that is
+    handled by settlement rather than by widening the included allowance.
+    """
+    lane = caller_identity.included_item_lane
+    if lane == "paid":
+        return paid_limit
+    resolved = tool_effective_item_limit("resolve_point", lane=lane, default=free_limit)
+    return max(free_limit, min(int(resolved or free_limit), paid_limit))
+
+
 def _point_bulk_shape_error(*, point_count: int, country_scope: str | None, target_admin_level: int | None, bulk_preset: str | None = None, threshold: int) -> dict | None:
     from mapmover.point_bulk_policy import point_bulk_shape_error
 
@@ -453,7 +467,7 @@ async def resolve_points_json_endpoint(req: Request):
     paid_limit = _point_lookup_paid_batch_limit()
     trusted_token, trusted_token_id = _trusted_artifact_access(req)
     caller_identity = request_caller_identity(req, ip_hash=hash_ip_for_analytics(get_client_ip(req)))
-    included_limit = paid_limit if caller_identity.can_use_included_bulk else limit
+    included_limit = _caller_included_point_limit(caller_identity, free_limit=limit, paid_limit=paid_limit)
     target_admin_level = _point_lookup_target_admin_level(body.get("target_admin_level", body.get("max_admin_level")))
     country_scope = str(body.get("country_scope") or body.get("country_hint") or "").strip().upper() or None
     from mapmover.point_bulk_policy import apply_global_bulk_preset
@@ -707,6 +721,7 @@ async def resolve_points_json_endpoint(req: Request):
         "paid_batch_limit": paid_limit,
         "included_batch_limit": included_limit,
         "included_account_bulk": caller_identity.can_use_included_bulk,
+        "access_tier": caller_identity.access_tier,
         "access_lane": "commercial_access" if commercial_context is not None else _access_lane(trusted_token),
         "artifact_token_id": trusted_token_id,
         "target_admin_level": f"admin_{target_admin_level}" if target_admin_level is not None else "deepest",

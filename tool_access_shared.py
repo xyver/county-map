@@ -16,7 +16,21 @@ Three product rules this file encodes:
    upstream license forbids paid hosted service, the tool stays free no matter
    what is authored here. See ``licensing_permits_paid_bulk``.
 
-To change a limit: edit ``free_item_limit`` / ``paid_item_limit`` here.
+**Entitlement limits, not safety ceilings.** Every limit in this file is an
+entitlement: it says how much of a tool a caller has *earned* the right to use,
+and a caller moves up the ladder by signing up or by paying. That is a
+different class of control from the safety ceilings that stop one request from
+hurting the server - process admission, concurrency, request-body size, read
+bytes and partitions, DuckDB memory, and wall time. Safety ceilings are
+non-bypassable and no plan, credit balance, or subscription may raise them.
+Keep the two classes separate: money moves an entitlement, never a ceiling.
+
+The three entitlement lanes are ``free`` (anonymous), ``account`` (verified,
+no paid plan), and ``paid`` (paid plan or settled call). They map one-to-one
+onto ``CallerIdentity.access_tier``.
+
+To change a limit: edit ``free_item_limit`` / ``account_item_limit`` /
+``paid_item_limit`` here.
 To swap a tool between free and paid: change ``pricing`` here, and nothing else.
 
 Env vars still override at runtime for incident response and load testing:
@@ -322,6 +336,31 @@ def tool_paid_item_limit(tool_name: str) -> int | None:
     return int(value) if isinstance(value, int) else None
 
 
+# How much larger an account allowance is than the anonymous one when a tool
+# does not author ``account_item_limit`` explicitly. Signing up should be worth
+# a visible jump without handing over the paid ceiling, which is the thing a
+# plan is meant to sell.
+ACCOUNT_ITEM_LIMIT_MULTIPLIER = 10
+
+
+def tool_account_item_limit(tool_name: str) -> int | None:
+    """Middle-rung item limit for a verified account with no paid plan.
+
+    Authored ``account_item_limit`` wins. Otherwise this is the free limit
+    scaled by ``ACCOUNT_ITEM_LIMIT_MULTIPLIER`` and clamped to the paid limit,
+    so a tool can never hand an unpaid account more than a paying one.
+    """
+    authored = tool_profile(tool_name).get("account_item_limit")
+    if isinstance(authored, int):
+        return int(authored)
+    free = tool_free_item_limit(tool_name)
+    if free is None:
+        return None
+    scaled = int(free) * ACCOUNT_ITEM_LIMIT_MULTIPLIER
+    paid = tool_paid_item_limit(tool_name)
+    return min(scaled, int(paid)) if paid is not None else scaled
+
+
 def _price_env_names(tool_name: str, field: str) -> tuple[str, ...]:
     """Env override names for one tool's price field, most specific first."""
     suffix = str(tool_name or "").strip().upper()
@@ -405,14 +444,20 @@ def tool_meter(tool_name: str) -> dict:
 def tool_effective_item_limit(tool_name: str, *, lane: str = "free", default: int | None = None) -> int | None:
     """Resolve one adjustable per-call limit from the shared registry.
 
-    ``lane`` is ``free``, ``paid``, or ``inline``. Every lane has one canonical
-    env name and may retain authored legacy names for compatibility.
+    ``lane`` is ``free``, ``account``, ``paid``, or ``inline``. Every lane has
+    one canonical env name and may retain authored legacy names for
+    compatibility.
     """
     normalized_lane = str(lane or "free").strip().lower()
     suffix = "".join(ch if ch.isalnum() else "_" for ch in str(tool_name or "").upper()).strip("_")
     if normalized_lane == "paid":
         env_names = (f"MCP_TOOL_PAID_BATCH_LIMIT_{suffix}", *tuple(tool_profile(tool_name).get("legacy_paid_limit_env") or ()))
         authored = tool_paid_item_limit(tool_name)
+    elif normalized_lane == "account":
+        env_names = (f"MCP_TOOL_ACCOUNT_BATCH_LIMIT_{suffix}",)
+        authored = tool_account_item_limit(tool_name)
+        if authored is None:
+            authored = tool_free_item_limit(tool_name)
     else:
         env_names = (f"MCP_TOOL_BATCH_LIMIT_{suffix}", *tool_legacy_limit_env(tool_name))
         authored = tool_inline_item_limit(tool_name) if normalized_lane == "inline" else tool_free_item_limit(tool_name)
