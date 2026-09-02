@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +21,8 @@ from mapmover.runtime.reference_exchange import (
 from mapmover.runtime.reference_graph import (
     aliases_for_loc_id,
     identity,
+    identity_at,
+    identities,
     public_alias_reference_systems,
     relationships_for_loc_id,
     resolve_public_loc_id,
@@ -54,15 +57,15 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
             "loc_id": "TST-A-001", "alias_type": "official_code",
             "source_system": "Test Authority", "source_vintage": "2026",
         }, {
-            "reference_system": "daedalmap.public.tst.test_sidechain.v1", "external_id": "TST-PUBLIC-A",
+            "reference_system": "public.tst.test_sidechain.v2", "external_id": "TST-PUBLIC-A",
             "loc_id": "TST-A-001", "alias_type": "preferred_public_loc_id",
             "source_system": "DaedalMap", "source_vintage": "2026",
         }, {
-            "reference_system": "daedalmap.public.tst.test_sidechain.v1", "external_id": "TST-PUBLIC-AMBIG",
+            "reference_system": "public.tst.test_sidechain.v2", "external_id": "TST-PUBLIC-AMBIG",
             "loc_id": "TST-A-001", "alias_type": "preferred_public_loc_id",
             "source_system": "DaedalMap", "source_vintage": "2026",
         }, {
-            "reference_system": "daedalmap.public.tst.test_sidechain.v1", "external_id": "TST-PUBLIC-AMBIG",
+            "reference_system": "public.tst.test_sidechain.v2", "external_id": "TST-PUBLIC-AMBIG",
             "loc_id": "TST-B-002", "alias_type": "preferred_public_loc_id",
             "source_system": "DaedalMap", "source_vintage": "2026",
         }]).to_parquet(self.root / "aliases.parquet", index=False)
@@ -138,15 +141,38 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
         self.assertTrue(any(row["external_id"] == "001" for row in aliases_for_loc_id("TST-A-001")))
         self.assertEqual(relationships_for_loc_id("TST-A-001")[0]["target_loc_id"], "TST-B-002")
 
+    def test_undated_single_and_batch_identity_queries_select_newest_version(self) -> None:
+        current = pd.read_parquet(self.root / "identities.parquet")
+        latest = current.loc[current.loc_id.eq("TST-A-001")].copy()
+        latest["name"] = "Current Area"
+        latest["namespace_release"] = "test_2026"
+        latest["source_vintage"] = "2026"
+        latest["valid_from"] = "2026-01-01"
+        older = latest.copy()
+        older["name"] = "Earlier Area"
+        older["namespace_release"] = "test_2025"
+        older["source_vintage"] = "2025"
+        older["valid_from"] = "2025-01-01"
+        others = current.loc[~current.loc_id.eq("TST-A-001")]
+        # Put the newest row first so a physical first/last-row accident cannot
+        # make both the single and batch APIs agree with the expected result.
+        pd.concat([latest, older, others], ignore_index=True).to_parquet(
+            self.root / "identities.parquet", index=False,
+        )
+
+        self.assertEqual(identity("TST-A-001")["name"], "Current Area")
+        self.assertEqual(identities(["TST-A-001"])[0]["name"], "Current Area")
+        self.assertEqual(identity_at("TST-A-001", date(2025, 6, 1))["name"], "Earlier Area")
+
     def test_preferred_public_loc_id_resolves_and_is_discoverable(self) -> None:
         resolved = resolve_public_loc_id("tst-public-a")
         self.assertTrue(resolved["ok"])
         self.assertEqual(resolved["loc_id"], "TST-A-001")
-        self.assertEqual(resolved["reference_system"], "daedalmap.public.tst.test_sidechain.v1")
+        self.assertEqual(resolved["reference_system"], "public.tst.test_sidechain.v2")
         systems = public_alias_reference_systems(iso3="TST")
         self.assertEqual(systems[0]["public_id_count"], 2)
         listed = {row["system"]: row for row in list_reference_systems(country_scope="TST")["systems"]}
-        public = listed["daedalmap.public.tst.test_sidechain.v1"]
+        public = listed["public.tst.test_sidechain.v2"]
         self.assertTrue(public["exchangeable"])
         self.assertEqual(public["exchange_via"], "preferred_public_loc_id")
 
@@ -156,7 +182,7 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
         self.assertEqual(resolved["error"]["code"], "ambiguous_public_loc_id")
         self.assertEqual(resolved["candidate_loc_ids"], ["TST-A-001", "TST-B-002"])
         direct = resolve_reference(
-            from_system="daedalmap.public.tst.test_sidechain.v1",
+            from_system="public.tst.test_sidechain.v2",
             value="TST-PUBLIC-AMBIG",
             iso3="TST",
         )
@@ -258,7 +284,7 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(
                 reference_graph.graph_roots_for_loc_id("ZZZ-G1"),
-                [global_root],
+                [country, global_root],
             )
 
 

@@ -1254,7 +1254,7 @@ def resolve_reference(
     text = str(value or "").strip()
     if not text:
         return {"ok": False, "from_system": system, "input": value, "error": "value is required"}
-    if system in {LOC_ID_SYSTEM, "admin_local", "admin_geometry"} or system.startswith("daedalmap.public."):
+    if system in {LOC_ID_SYSTEM, "admin_local", "admin_geometry"} or system.startswith("public."):
         return _clean_json(_direct_loc_id_result(text, request_system=system))
     if get_external_adapter(system):
         # External edges own their typed relationship and two release clocks.
@@ -1847,10 +1847,49 @@ def get_geometry_references(
     include_info: bool = True,
 ) -> dict[str, Any]:
     """Return geometry metadata for one or more loc_ids using one geometry fetch pipeline."""
-    resolutions = [resolve_loc_id_input(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    # Current administrative geometry is already keyed by the canonical loc_id
+    # in the geometry bank.  Check that exact key first so a normal geometry
+    # request does not open the reference graph merely to prove that its input
+    # is unchanged.  Inputs that miss the exact bank still go through the graph
+    # resolver, which preserves preferred-public-loc_id aliases.
+    requested_ids = [canonicalize_loc_id(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    direct_rows = get_selection_geometry_metadata(requested_ids) if not include_polygon else []
+    direct_ids = {
+        canonicalize_loc_id(str(row.get("loc_id") or row.get("source_loc_id") or ""))
+        for row in direct_rows
+        if (row.get("loc_id") or row.get("source_loc_id"))
+        and row.get("admin_level") is not None
+        and _reference_family(
+            canonicalize_loc_id(str(row.get("loc_id") or row.get("source_loc_id") or "")),
+            admin_level=row.get("admin_level"),
+        ) in {"admin_0", "admin_local", "admin_geometry"}
+    }
+    resolutions = [
+        {
+            "ok": True,
+            "status": "unchanged",
+            "requested_loc_id": requested,
+            "loc_id": requested,
+            "resolved_from_public_alias": False,
+        }
+        if requested in direct_ids else resolve_loc_id_input(requested)
+        for requested in requested_ids
+    ]
     canonical_ids = [str(item.get("loc_id")) for item in resolutions if item.get("ok") and item.get("loc_id")]
     if not include_polygon:
-        rows = get_selection_geometry_metadata(canonical_ids)
+        fetched_ids = {
+            canonicalize_loc_id(str(row.get("loc_id") or row.get("source_loc_id") or ""))
+            for row in direct_rows
+            if row.get("loc_id") or row.get("source_loc_id")
+        }
+        attempted_ids = set(requested_ids)
+        missing_ids = [
+            loc_id
+            for loc_id in canonical_ids
+            if canonicalize_loc_id(loc_id) not in fetched_ids
+            and canonicalize_loc_id(loc_id) not in attempted_ids
+        ]
+        rows = [*direct_rows, *(get_selection_geometry_metadata(missing_ids) if missing_ids else [])]
         by_loc_id: dict[str, dict[str, Any]] = {}
         for row in rows:
             row_loc_id = row.get("loc_id") or row.get("source_loc_id")

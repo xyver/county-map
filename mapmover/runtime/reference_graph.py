@@ -25,7 +25,7 @@ from .geometry_catalog import load_geometry_catalog
 
 ENV_NAME = "GEOGRAPHY_REFERENCE_GRAPH_ROOT"
 PUBLIC_ALIAS_TYPE = "preferred_public_loc_id"
-PUBLIC_REFERENCE_PREFIX = "daedalmap.public."
+PUBLIC_REFERENCE_PREFIX = "public."
 
 #: Every country publishes its graph in the same place and the same shape.
 #: There is one format - a hash-pinned partition index - so this module never
@@ -63,6 +63,14 @@ PARTITION_INDEXES = {
     "aliases": "alias_partitions.parquet",
     "relationships": "relationship_partitions.parquet",
 }
+
+IDENTITY_RECENCY_ORDER = (
+    "NULLIF(CAST(valid_from AS VARCHAR), '') DESC NULLS LAST, "
+    "NULLIF(CAST(namespace_release AS VARCHAR), '') DESC NULLS LAST, "
+    "NULLIF(CAST(source_vintage AS VARCHAR), '') DESC NULLS LAST, "
+    "NULLIF(CAST(geography_family AS VARCHAR), '') DESC NULLS LAST, "
+    "NULLIF(CAST(family AS VARCHAR), '') DESC NULLS LAST"
+)
 
 
 def _sql_path(path: Path) -> str:
@@ -224,9 +232,15 @@ def graph_root_for_loc_id(loc_id: str | None) -> Path | None:
 def graph_roots_for_loc_id(loc_id: str | None) -> list[Path]:
     """Prefer country authority, then retain the global fallback."""
     roots: list[Path] = []
-    country = graph_root_for_loc_id(loc_id)
-    if country is not None:
-        roots.append(country)
+    country_roots = reference_graph_roots()
+    prefix = str(loc_id or "").split("-", 1)[0].strip().upper()
+    if prefix in country_roots:
+        roots.append(country_roots[prefix])
+    elif loc_id:
+        # Some authority-owned namespaces are intentionally not ISO-prefixed.
+        # Search admitted country graphs deterministically; admission requires
+        # singular identity ownership within each graph.
+        roots.extend(country_roots[key] for key in sorted(country_roots))
     global_root = global_reference_graph_root()
     if global_root is not None and global_root not in roots:
         roots.append(global_root)
@@ -471,8 +485,9 @@ def identity(loc_id: str) -> dict[str, Any] | None:
             if not source:
                 continue
             cursor = connection.execute(
-                f"SELECT {_identity_columns_for_roots([root])} "
-                f"FROM read_parquet({source}, union_by_name=True) WHERE loc_id = ? LIMIT 1",
+                f"SELECT * FROM (SELECT {_identity_columns_for_roots([root])} "
+                f"FROM read_parquet({source}, union_by_name=True)) AS candidates "
+                f"WHERE loc_id = ? ORDER BY {IDENTITY_RECENCY_ORDER} LIMIT 1",
                 [str(loc_id)],
             )
             row = cursor.fetchone()
@@ -498,12 +513,14 @@ def identity_at(loc_id: str, as_of: date | None = None) -> dict[str, Any] | None
     connection = _connection()
     try:
         cursor = connection.execute(
-            f"""SELECT *
-                FROM read_parquet({_table_source('identity_versions')}, union_by_name=True)
+            f"""SELECT * FROM (
+                    SELECT {_identity_columns()}
+                    FROM read_parquet({_table_source('identity_versions')}, union_by_name=True)
+                ) AS candidates
                 WHERE loc_id = ?
                   AND (valid_from IS NULL OR valid_from = '' OR CAST(valid_from AS DATE) <= ?)
                   AND (valid_to IS NULL OR valid_to = '' OR CAST(valid_to AS DATE) > ?)
-                ORDER BY valid_from DESC NULLS LAST, namespace_release DESC
+                ORDER BY {IDENTITY_RECENCY_ORDER}
                 LIMIT 1""",
             [str(loc_id), as_of, as_of],
         )
@@ -513,10 +530,12 @@ def identity_at(loc_id: str, as_of: date | None = None) -> dict[str, Any] | None
             # requested date falls outside it, so callers can report a typed
             # temporal mismatch instead of treating the loc_id as unknown.
             cursor = connection.execute(
-                f"""SELECT *
-                    FROM read_parquet({_table_source('identity_versions')}, union_by_name=True)
+                f"""SELECT * FROM (
+                        SELECT {_identity_columns()}
+                        FROM read_parquet({_table_source('identity_versions')}, union_by_name=True)
+                    ) AS candidates
                     WHERE loc_id = ?
-                    ORDER BY valid_from DESC NULLS LAST, namespace_release DESC
+                    ORDER BY {IDENTITY_RECENCY_ORDER}
                     LIMIT 1""",
                 [str(loc_id)],
             )
@@ -533,19 +552,51 @@ def identities(loc_ids: list[str]) -> list[dict[str, Any]]:
     requested = list(dict.fromkeys(str(item).strip() for item in loc_ids if str(item).strip()))
     if not requested or not reference_graph_available():
         return []
-    source = _table_source("identities")
-    if not source:
+    # Resolve the shared source before opening DuckDB.  A graph can be
+    # discoverable through its catalog while its identity partition index is
+    # empty or unavailable; that is a clean fail-closed result, not a reason
+    # to construct a connection (or issue a broad fallback query).
+    if not _table_source("identities"):
         return []
-    placeholders = ", ".join("?" for _ in requested)
+    # Query roots in authority order.  Combining a country graph with the
+    # global fallback in one UNION makes their shared Admin IDs peers and lets
+    # physical scan order decide which metadata wins.
+    remaining = requested[:]
+    found: dict[str, dict[str, Any]] = {}
     connection = _connection()
     try:
-        cursor = connection.execute(
-            f"SELECT {_identity_columns()} FROM read_parquet({source}, union_by_name=True) "
-            f"WHERE loc_id IN ({placeholders})",
-            requested,
-        )
-        columns = [item[0] for item in cursor.description]
-        found = {str(row[0]): dict(zip(columns, row)) for row in cursor.fetchall()}
+        roots: list[Path] = []
+        for loc_id in requested:
+            for root in graph_roots_for_loc_id(loc_id):
+                if root not in roots:
+                    roots.append(root)
+        selected_columns = ", ".join(f'"{column}"' for column in IDENTITY_COLUMNS)
+        for root in roots:
+            if not remaining:
+                break
+            source = _table_source_for_roots("identities", [root])
+            if not source:
+                continue
+            placeholders = ", ".join("?" for _ in remaining)
+            cursor = connection.execute(
+                f"""WITH candidates AS (
+                        SELECT {_identity_columns_for_roots([root])}
+                        FROM read_parquet({source}, union_by_name=True)
+                        WHERE loc_id IN ({placeholders})
+                    ), ranked AS (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY loc_id ORDER BY {IDENTITY_RECENCY_ORDER}
+                        ) AS __identity_rank
+                        FROM candidates
+                    )
+                    SELECT {selected_columns} FROM ranked WHERE __identity_rank = 1""",
+                remaining,
+            )
+            columns = [item[0] for item in cursor.description]
+            for row in cursor.fetchall():
+                item = dict(zip(columns, row))
+                found[str(item["loc_id"])] = item
+            remaining = [loc_id for loc_id in remaining if loc_id not in found]
         return [found[loc_id] for loc_id in requested if loc_id in found]
     finally:
         connection.close()
@@ -605,7 +656,7 @@ def resolve_public_loc_id(loc_id: str) -> dict[str, Any]:
 
     Canonical identities always win.  Public aliases are deliberately narrower
     than the graph's general alias surface: only ``preferred_public_loc_id``
-    rows in a ``daedalmap.public.*`` reference system may stand in for a
+    rows in a ``public.*`` reference system may stand in for a
     loc_id.  More than one distinct target fails closed instead of choosing a
     target by partition or row order.
     """

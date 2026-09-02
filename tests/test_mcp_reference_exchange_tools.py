@@ -825,7 +825,7 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
                     "loc_id": "USA-IL-167-PLACE-12345",
                     "resolved_from_public_alias": True,
                     "public_alias": "USA-PLACE-SPRINGFIELD-IL",
-                    "reference_system": "daedalmap.public.usa.place.v1",
+                    "reference_system": "public.usa.place.v2",
                 },
             ),
             mock.patch(

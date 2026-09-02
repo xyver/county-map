@@ -58,6 +58,7 @@ class ReferenceGeometryBankRuntimeTests(unittest.TestCase):
             "geometry_bank": "geometry/countries/CAN/relationships/example",
             "has_shape": True,
             "family": "can_designated_place",
+            "geography_family": "place_or_municipality",
             "source_native_subtype": "designated_place",
             "name": "Example",
         }]
@@ -68,6 +69,8 @@ class ReferenceGeometryBankRuntimeTests(unittest.TestCase):
         }])
         shape_rows = pd.DataFrame([{
             "loc_id": retired_id,
+            "family": "can_designated_place_2021",
+            "geography_family": "place_or_municipality",
             "geometry": box(-80, 43, -79, 44).wkb,
         }])
         selected_filters = []
@@ -89,6 +92,7 @@ class ReferenceGeometryBankRuntimeTests(unittest.TestCase):
         self.assertEqual(len(frame), 1)
         self.assertEqual(frame.iloc[0]["loc_id"], canonical_id)
         self.assertEqual(frame.iloc[0]["name"], "Example")
+        self.assertEqual(frame.iloc[0]["family"], "place_or_municipality")
         self.assertEqual(frame.iloc[0]["subtype"], "designated_place")
         self.assertEqual(frame.iloc[0]["geometry"]["type"], "Polygon")
 

@@ -187,7 +187,16 @@ def _normalized_row(
         "loc_id": identity.get("loc_id") or row.get("loc_id"),
         "name": row.get("name") or row.get("name_en") or identity.get("name"),
         "name_local": row.get("name_fr"),
-        "family": row.get("family") or identity.get("family"),
+        # ``family`` is the public semantic family.  Shape partitions may
+        # retain a source/package implementation family (for example a
+        # vintage-specific Canadian water-body family), so it must not
+        # override the graph's reviewed geography-family classification.
+        "family": (
+            identity.get("geography_family")
+            or row.get("geography_family")
+            or identity.get("family")
+            or row.get("family")
+        ),
         "subtype": row.get("subtype") or identity.get("subtype") or identity.get("source_native_subtype"),
         "source_native_subtype": identity.get("source_native_subtype"),
         "admin_level": identity.get("admin_level"),
