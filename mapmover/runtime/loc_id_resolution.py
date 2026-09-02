@@ -9,7 +9,7 @@ import pandas as pd
 from ..geometry_handlers import (
     get_selection_geometries,
     load_country_parquet,
-    load_global_countries_frame,
+    load_global_country_display_frame,
     load_subcounty_geometry,
     resolve_point_to_location as legacy_resolve_point_to_location,
 )
@@ -294,7 +294,10 @@ def _resolve_country_geometry_name(
 
 
 def _resolve_country_name_from_global_geometry(query: str) -> dict[str, Any] | None:
-    df = load_global_countries_frame()
+    # Name-to-loc_id matching reads the name column only. The Display bank
+    # carries every Admin0 name and costs ~5 MB against the exact bank's
+    # 400 MB+, which this path never needed.
+    df = load_global_country_display_frame()
     if df is None or df.empty:
         return None
 

@@ -6,17 +6,24 @@ import re
 from pathlib import Path
 from typing import Callable, Optional
 
-from .foundation_helpers import load_global_countries_frame
+from .foundation_helpers import load_global_country_display_frame
 _PARQUET_NAMES_CACHE = {}
 _PARQUET_SORTED_NAMES_CACHE = {}
 
 
 def get_countries_in_viewport(bounds: dict, *, geometry_dir: Path, logger) -> list:
-    """Get ISO3 codes visible in a viewport using exact query geometry."""
+    """Get ISO3 codes visible in a viewport from stored Admin0 bounding boxes.
+
+    This reads four numeric columns and never touches a polygon, so it uses the
+    bounded Display bank rather than the exact one. The exact bank also merges
+    its supplemental territories at runtime with null bboxes, which silently
+    dropped Hong Kong, Macao, Puerto Rico, Gibraltar, Jersey, Svalbard, and the
+    rest of that set from every viewport.
+    """
     if not bounds:
         return []
-    df = load_global_countries_frame()
-    if df is None:
+    df = load_global_country_display_frame()
+    if df is None or df.empty:
         return []
     try:
         v_west = bounds.get("west", -180)

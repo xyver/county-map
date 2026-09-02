@@ -1023,10 +1023,25 @@ def _load_deep_geometry_index_rows(
     return pd.concat(frames, ignore_index=True)
 
 
+# Display polygons are simplified, so their stored bounding boxes sit slightly
+# inside the exact ones - the observed gap is under 0.04 degrees for every
+# country whose territory attribution matches between the two banks. Country
+# bounds are only ever used to shortlist candidates, and a shortlist must
+# over-select rather than under-select, so pad each edge past that gap.
+COUNTRY_BOUNDS_DISPLAY_PAD_DEG = 0.05
+
+
 def load_country_bounds():
     """
-    Load exact country bounding boxes from global.csv for query filtering.
+    Load country bounding boxes for query filtering.
     Returns dict of iso3 -> (min_lon, min_lat, max_lon, max_lat).
+
+    Bounds come from the bounded Admin0 Display bank, which stores them as
+    columns. The exact global bank is a 400 MB+ CSV whose polygons had to be
+    parsed with shapely just to recover numbers the Display bank already
+    carries, and loading it here pulled exact geometry into ordinary viewport
+    and map requests. Point containment still uses the exact bank; see
+    resolve_point_to_location and resolve_points_to_locations.
     """
     global _country_bounds_cache
     if _country_bounds_cache is not None:
@@ -1034,32 +1049,38 @@ def load_country_bounds():
 
     _country_bounds_cache = {}
 
-    df = load_global_countries_frame()
-    if df is None:
+    df = load_global_country_display_frame()
+    if df is None or df.empty:
+        logger.warning("Country bounds unavailable: Admin0 Display bank not loaded")
         return _country_bounds_cache
 
-    try:
-        from shapely.geometry import shape
+    bbox_columns = ("bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat")
+    if not all(column in df.columns for column in bbox_columns):
+        logger.warning("Admin0 Display bank is missing bbox columns; country bounds empty")
+        return _country_bounds_cache
 
-        for _, row in df.iterrows():
-            loc_id = row.get('loc_id')
-            geom_str = row.get('geometry')
+    pad = COUNTRY_BOUNDS_DISPLAY_PAD_DEG
+    for row in df[["loc_id", *bbox_columns]].to_dict("records"):
+        loc_id = row.get("loc_id")
+        if not loc_id:
+            continue
+        try:
+            min_lon = float(row["bbox_min_lon"])
+            min_lat = float(row["bbox_min_lat"])
+            max_lon = float(row["bbox_max_lon"])
+            max_lat = float(row["bbox_max_lat"])
+        except (TypeError, ValueError):
+            continue
+        if any(pd.isna(value) for value in (min_lon, min_lat, max_lon, max_lat)):
+            continue
+        _country_bounds_cache[loc_id] = (
+            max(min_lon - pad, -180.0),
+            max(min_lat - pad, -90.0),
+            min(max_lon + pad, 180.0),
+            min(max_lat + pad, 90.0),
+        )
 
-            if not loc_id or pd.isna(geom_str) or not geom_str:
-                continue
-
-            try:
-                geom_data = json.loads(geom_str) if isinstance(geom_str, str) else geom_str
-                geom = shape(geom_data)
-                bounds = geom.bounds  # (minx, miny, maxx, maxy)
-                _country_bounds_cache[loc_id] = bounds
-            except Exception:
-                continue
-
-        logger.info(f"Loaded bounds for {len(_country_bounds_cache)} countries")
-    except ImportError:
-        logger.warning("shapely not available for country bounds computation")
-
+    logger.info("Loaded bounds for %d countries from Admin0 Display bank", len(_country_bounds_cache))
     return _country_bounds_cache
 
 
@@ -1178,15 +1199,18 @@ def get_countries_in_bbox(min_lon: float, min_lat: float, max_lon: float, max_la
             c_max_lat >= min_lat and c_min_lat <= max_lat):
             # Multi-part countries spanning the antimeridian or distant
             # territories can have an almost-worldwide bounding box. Confirm
-            # those coarse candidates against the exact polygon so Russia,
+            # those coarse candidates against the country outline so Russia,
             # France, or the USA do not make every mid-latitude viewport load
-            # unrelated country banks.
+            # unrelated country banks. The Display outline is the right
+            # precision for a shortlist: being wrong here loads one extra
+            # country bank, and reading the exact bank instead pulled 400 MB+
+            # of query geometry into a map request.
             if c_max_lon - c_min_lon >= 300:
                 try:
                     from shapely.geometry import box, shape
 
                     if broad_country_rows is None:
-                        broad_country_rows = load_global_countries_frame()
+                        broad_country_rows = load_global_country_display_frame()
                         viewport_polygon = box(min_lon, min_lat, max_lon, max_lat)
                     row = broad_country_rows[broad_country_rows["loc_id"] == iso3]
                     if not row.empty:
@@ -1195,7 +1219,7 @@ def get_countries_in_bbox(min_lon: float, min_lat: float, max_lon: float, max_la
                         if not geometry.intersects(viewport_polygon):
                             continue
                 except Exception:
-                    logger.debug("Exact-polygon country shortlist failed for %s", iso3, exc_info=True)
+                    logger.debug("Display-outline country shortlist failed for %s", iso3, exc_info=True)
             result.append(iso3)
 
     return result
@@ -3036,9 +3060,10 @@ def _get_parent_hierarchy(df, parent_id: str, iso3: str) -> list:
             break
 
         # Check if it's the country level
+        # Names come from the Display bank. This needs one string, and the
+        # exact bank would cost a 400 MB+ read to supply it.
         if current_id == iso3:
-            # Get country name from global.csv
-            global_df = load_global_countries_frame()
+            global_df = load_global_country_display_frame()
             if global_df is not None:
                 country_row = global_df[global_df["loc_id"] == iso3]
                 if len(country_row) > 0:
@@ -3792,7 +3817,10 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
                     regular_sub_level_ids.append(lid)
 
         if country_level_ids:
-            global_df = load_global_countries_frame()
+            # Metadata only; the Display bank carries every column this row
+            # builder reads and covers the territories the exact bank folds
+            # into their parent country.
+            global_df = load_global_country_display_frame()
             if global_df is not None and not global_df.empty:
                 country_rows = global_df[global_df["loc_id"].isin(country_level_ids)]
                 for _, row in country_rows.iterrows():

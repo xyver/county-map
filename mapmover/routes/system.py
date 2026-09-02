@@ -2269,7 +2269,11 @@ async def debug_geometry(req: Request):
     import traceback
     import pandas as pd
     from mapmover.paths import DATA_ROOT, GEOMETRY_DIR
-    from mapmover.foundation_helpers import load_global_countries_frame
+    from mapmover import foundation_helpers
+    from mapmover.foundation_helpers import (
+        load_global_countries_frame,
+        load_global_country_display_frame,
+    )
     from mapmover.geometry_handlers import get_geometry_path
 
     result = {
@@ -2287,6 +2291,31 @@ async def debug_geometry(req: Request):
         result["get_geometry_path"] = str(geom_path) if geom_path else None
     except Exception as e:
         result["get_geometry_path_error"] = str(e)
+
+    # The Display bank is the one every map and site path reads, so report it
+    # first and unconditionally.
+    try:
+        display_df = load_global_country_display_frame()
+        if display_df is None:
+            result["admin0_display"] = None
+        else:
+            result["admin0_display_rows"] = len(display_df)
+            result["admin0_display_cols"] = list(display_df.columns)
+    except Exception as e:
+        result["admin0_display_error"] = str(e)
+
+    # Reading the exact bank materializes a 400 MB+ CSV for the life of the
+    # process. Report whatever is already cached, and load it only when the
+    # caller explicitly asks, so opening this page cannot push Railway into
+    # an out-of-memory restart.
+    result["exact_global_loaded"] = foundation_helpers._GLOBAL_COUNTRIES_CACHE is not None
+    load_exact = str(req.query_params.get("load_exact", "") or "").strip().lower() in {"1", "true", "yes"}
+    if not load_exact:
+        result["exact_global_note"] = (
+            "Exact global.csv not loaded by this request. Append ?load_exact=1 to force it; "
+            "it costs a 400 MB+ read that stays resident."
+        )
+        return result
 
     try:
         df = load_global_countries_frame()

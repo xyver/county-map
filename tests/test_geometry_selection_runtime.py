@@ -42,8 +42,12 @@ class GeometrySelectionRuntimeTests(unittest.TestCase):
         self.assertEqual(1, result["count"])
         self.assertEqual("VAT", result["geojson"]["features"][0]["properties"]["loc_id"])
 
-    def test_country_shortlist_checks_near_global_bounds_against_exact_shape(self):
-        exact = pd.DataFrame([{
+    def test_country_shortlist_checks_near_global_bounds_against_display_shape(self):
+        # A near-worldwide bbox is confirmed against the country outline so a
+        # mid-latitude viewport does not load unrelated country banks. The
+        # shortlist reads the Display bank; pulling the exact bank here would
+        # materialize a 400 MB+ CSV inside an ordinary map request.
+        display = pd.DataFrame([{
             "loc_id": "RUS",
             "geometry": json.dumps(box(30.0, 45.0, 180.0, 80.0).__geo_interface__),
         }])
@@ -52,7 +56,10 @@ class GeometrySelectionRuntimeTests(unittest.TestCase):
             return_value={"RUS": (-180.0, 41.0, 180.0, 82.0)},
         ), patch(
             "mapmover.geometry_handlers.load_global_countries_frame",
-            return_value=exact,
+            side_effect=AssertionError("viewport shortlist must not read exact geometry"),
+        ), patch(
+            "mapmover.geometry_handlers.load_global_country_display_frame",
+            return_value=display,
         ):
             result = get_countries_in_bbox(-140.0, 45.0, -60.0, 75.0)
 
