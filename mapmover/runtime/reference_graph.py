@@ -26,6 +26,7 @@ from .geometry_catalog import load_geometry_catalog
 ENV_NAME = "GEOGRAPHY_REFERENCE_GRAPH_ROOT"
 PUBLIC_ALIAS_TYPE = "preferred_public_loc_id"
 PUBLIC_REFERENCE_PREFIX = "public."
+LEGACY_PUBLIC_REFERENCE_PREFIX = "daedalmap.public."
 
 #: Every country publishes its graph in the same place and the same shape.
 #: There is one format - a hash-pinned partition index - so this module never
@@ -681,9 +682,14 @@ def resolve_public_loc_id(loc_id: str) -> dict[str, Any]:
             f"""SELECT * FROM read_parquet({source}, union_by_name=True)
                 WHERE upper(external_id) = ?
                   AND lower(alias_type) = ?
-                  AND lower(reference_system) LIKE ?
+                  AND (lower(reference_system) LIKE ? OR lower(reference_system) LIKE ?)
                 ORDER BY reference_system, loc_id""",
-            [requested, PUBLIC_ALIAS_TYPE, f"{PUBLIC_REFERENCE_PREFIX}%"],
+            [
+                requested,
+                PUBLIC_ALIAS_TYPE,
+                f"{PUBLIC_REFERENCE_PREFIX}%",
+                f"{LEGACY_PUBLIC_REFERENCE_PREFIX}%",
+            ],
         )
         columns = [item[0] for item in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -750,10 +756,14 @@ def public_alias_reference_systems(*, iso3: str | None = None) -> list[dict[str,
                        count(DISTINCT loc_id) AS identity_count
                 FROM read_parquet({source}, union_by_name=True)
                 WHERE lower(alias_type) = ?
-                  AND lower(reference_system) LIKE ?
+                  AND (lower(reference_system) LIKE ? OR lower(reference_system) LIKE ?)
                 GROUP BY reference_system
                 ORDER BY reference_system""",
-            [PUBLIC_ALIAS_TYPE, f"{PUBLIC_REFERENCE_PREFIX}%"],
+            [
+                PUBLIC_ALIAS_TYPE,
+                f"{PUBLIC_REFERENCE_PREFIX}%",
+                f"{LEGACY_PUBLIC_REFERENCE_PREFIX}%",
+            ],
         )
         return [
             {

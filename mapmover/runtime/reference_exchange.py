@@ -1254,7 +1254,9 @@ def resolve_reference(
     text = str(value or "").strip()
     if not text:
         return {"ok": False, "from_system": system, "input": value, "error": "value is required"}
-    if system in {LOC_ID_SYSTEM, "admin_local", "admin_geometry"} or system.startswith("public."):
+    if system in {LOC_ID_SYSTEM, "admin_local", "admin_geometry"} or system.startswith(
+        ("public.", "daedalmap.public.")
+    ):
         return _clean_json(_direct_loc_id_result(text, request_system=system))
     if get_external_adapter(system):
         # External edges own their typed relationship and two release clocks.

@@ -68,6 +68,10 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
             "reference_system": "public.tst.test_sidechain.v2", "external_id": "TST-PUBLIC-AMBIG",
             "loc_id": "TST-B-002", "alias_type": "preferred_public_loc_id",
             "source_system": "DaedalMap", "source_vintage": "2026",
+        }, {
+            "reference_system": "daedalmap.public.tst.test_sidechain.v1", "external_id": "TST-LEGACY-A",
+            "loc_id": "TST-A-001", "alias_type": "preferred_public_loc_id",
+            "source_system": "DaedalMap", "source_vintage": "2025",
         }]).to_parquet(self.root / "aliases.parquet", index=False)
         pd.DataFrame([{
             "relationship_id": "TST-REL-1", "source_family": "test_sidechain",
@@ -169,8 +173,11 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
         self.assertTrue(resolved["ok"])
         self.assertEqual(resolved["loc_id"], "TST-A-001")
         self.assertEqual(resolved["reference_system"], "public.tst.test_sidechain.v2")
-        systems = public_alias_reference_systems(iso3="TST")
-        self.assertEqual(systems[0]["public_id_count"], 2)
+        systems = {row["system"]: row for row in public_alias_reference_systems(iso3="TST")}
+        self.assertEqual(systems["public.tst.test_sidechain.v2"]["public_id_count"], 2)
+        legacy = resolve_public_loc_id("tst-legacy-a")
+        self.assertTrue(legacy["ok"])
+        self.assertEqual(legacy["loc_id"], "TST-A-001")
         listed = {row["system"]: row for row in list_reference_systems(country_scope="TST")["systems"]}
         public = listed["public.tst.test_sidechain.v2"]
         self.assertTrue(public["exchangeable"])
