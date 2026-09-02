@@ -100,6 +100,44 @@ def clear_foundation_helper_cache() -> None:
     _WORLD_FACTBOOK_STATIC_CACHE = None
 
 
+# One read ladder for every runtime-owned geometry helper artifact. These
+# artifacts have to agree with each other - the Admin0 Display bank, the exact
+# Admin0 bank, and the per-country crosswalks all describe the same universe -
+# so they must not each decide independently which lane to read. The ladder was
+# written out by hand in three places and only one of them stated the
+# local-verification rule, which is how the lanes drift apart.
+#
+# Order, strongest first:
+#
+#   1. localhost explicitly selected strict cloud reads, so ignore local files;
+#   2. the local artifact exists, so use it;
+#   3. local verification posture (DEPLOYMENT=local + STORAGE_MODE=local), which
+#      must never reach the network for a missing artifact;
+#   4. cloud mode, so read the published lane;
+#   5. nothing to read.
+#
+# Step 3 cannot fire while step 4 would have succeeded, because
+# `prefer_local_geometry_reads()` is false whenever the data plane is cloud. It
+# is stated anyway so the posture is visible at the seam instead of implied.
+READ_LOCAL = "local"
+READ_REMOTE = "remote"
+READ_UNAVAILABLE = "unavailable"
+
+
+def resolve_artifact_read(local_path: Path) -> str:
+    """Return which lane a runtime helper artifact should be read from."""
+    forced_remote = force_remote_data_reads()
+    if forced_remote and is_cloud_mode():
+        return READ_REMOTE
+    if not forced_remote and local_path.exists():
+        return READ_LOCAL
+    if prefer_local_geometry_reads():
+        return READ_UNAVAILABLE
+    if is_cloud_mode():
+        return READ_REMOTE
+    return READ_UNAVAILABLE
+
+
 def _parquet_accessible(path: Path) -> bool:
     """Returns True if a parquet file exists locally or is accessible via S3/DuckDB."""
     if not is_cloud_mode():
@@ -342,7 +380,8 @@ def load_country_crosswalk(iso3: str) -> dict | None:
         return _COUNTRY_CROSSWALK_CACHE[cache_key]
 
     crosswalk_path = COUNTRY_GEOMETRY_DIR / iso3 / "crosswalk.json"
-    if crosswalk_path.exists() and not force_remote_data_reads():
+    lane = resolve_artifact_read(crosswalk_path)
+    if lane == READ_LOCAL:
         try:
             with open(crosswalk_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -353,20 +392,14 @@ def load_country_crosswalk(iso3: str) -> dict | None:
             _COUNTRY_CROSSWALK_CACHE[cache_key] = None
             return None
 
-    if prefer_local_geometry_reads():
-        _COUNTRY_CROSSWALK_CACHE[cache_key] = None
-        return None
+    if lane == READ_REMOTE:
+        try:
+            data = read_artifact_json(f"geometry/countries/{iso3}/crosswalk.json", lane="published")
+            _COUNTRY_CROSSWALK_CACHE[cache_key] = data
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to load crosswalk for {iso3} from cloud storage: {e}")
 
-    if force_remote_data_reads() or not crosswalk_path.exists():
-        if is_cloud_mode():
-            try:
-                data = read_artifact_json(f"geometry/countries/{iso3}/crosswalk.json", lane="published")
-                _COUNTRY_CROSSWALK_CACHE[cache_key] = data
-                return data
-            except Exception as e:
-                logger.warning(f"Failed to load crosswalk for {iso3} from cloud storage: {e}")
-        _COUNTRY_CROSSWALK_CACHE[cache_key] = None
-        return None
     _COUNTRY_CROSSWALK_CACHE[cache_key] = None
     return None
 
@@ -384,7 +417,8 @@ def load_country_json_asset(iso3: str, filename: str) -> Any:
         return _COUNTRY_JSON_ASSET_CACHE[cache_key]
 
     asset_path = COUNTRIES_DIR / iso3 / filename
-    if asset_path.exists() and not force_remote_data_reads():
+    lane = resolve_artifact_read(asset_path)
+    if lane == READ_LOCAL:
         try:
             with open(asset_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -395,20 +429,14 @@ def load_country_json_asset(iso3: str, filename: str) -> Any:
             _COUNTRY_JSON_ASSET_CACHE[cache_key] = None
             return None
 
-    if prefer_local_geometry_reads():
-        _COUNTRY_JSON_ASSET_CACHE[cache_key] = None
-        return None
+    if lane == READ_REMOTE:
+        try:
+            data = read_artifact_json(f"countries/{iso3}/{filename}", lane="published")
+            _COUNTRY_JSON_ASSET_CACHE[cache_key] = data
+            return data
+        except Exception as e:
+            logger.warning("Failed to load country asset %s/%s from cloud storage: %s", iso3, filename, e)
 
-    if force_remote_data_reads() or not asset_path.exists():
-        if is_cloud_mode():
-            try:
-                data = read_artifact_json(f"countries/{iso3}/{filename}", lane="published")
-                _COUNTRY_JSON_ASSET_CACHE[cache_key] = data
-                return data
-            except Exception as e:
-                logger.warning("Failed to load country asset %s/%s from cloud storage: %s", iso3, filename, e)
-        _COUNTRY_JSON_ASSET_CACHE[cache_key] = None
-        return None
     _COUNTRY_JSON_ASSET_CACHE[cache_key] = None
     return None
 
@@ -420,60 +448,67 @@ def load_global_countries_frame():
         return _GLOBAL_COUNTRIES_CACHE
 
     global_file = GEOMETRY_DIR / "global.csv"
-    if global_file.exists() and not force_remote_data_reads():
+    lane = resolve_artifact_read(global_file)
+
+    def _merge_supplemental(base, origin: str):
+        existing_loc_ids = set(base["loc_id"].dropna().astype(str).str.strip().str.upper()) if "loc_id" in base.columns else set()
+        supplemental = _load_supplemental_admin0_frame(list(base.columns), existing_loc_ids)
+        frame = pd.concat([base, supplemental], ignore_index=True) if not supplemental.empty else base
+        logger.info(
+            "Loaded %d countries from %s plus %d supplemental Admin0 rows",
+            len(frame),
+            origin,
+            len(supplemental),
+        )
+        return frame
+
+    if lane == READ_LOCAL:
         try:
-            base = pd.read_csv(global_file)
-            existing_loc_ids = set(base["loc_id"].dropna().astype(str).str.strip().str.upper()) if "loc_id" in base.columns else set()
-            supplemental = _load_supplemental_admin0_frame(list(base.columns), existing_loc_ids)
-            _GLOBAL_COUNTRIES_CACHE = pd.concat([base, supplemental], ignore_index=True) if not supplemental.empty else base
-            logger.info(
-                "Loaded %d countries from global.csv plus %d supplemental Admin0 rows",
-                len(_GLOBAL_COUNTRIES_CACHE),
-                len(supplemental),
-            )
+            _GLOBAL_COUNTRIES_CACHE = _merge_supplemental(pd.read_csv(global_file), "global.csv")
             return _GLOBAL_COUNTRIES_CACHE
         except Exception as e:
             logger.error(f"Error loading global.csv: {e}")
             return None
 
-    if is_cloud_mode():
+    if lane == READ_REMOTE:
         try:
             raw = read_artifact_bytes("geometry/global.csv", lane="published").decode("utf-8-sig")
-            base = pd.read_csv(StringIO(raw))
-            existing_loc_ids = set(base["loc_id"].dropna().astype(str).str.strip().str.upper()) if "loc_id" in base.columns else set()
-            supplemental = _load_supplemental_admin0_frame(list(base.columns), existing_loc_ids)
-            _GLOBAL_COUNTRIES_CACHE = pd.concat([base, supplemental], ignore_index=True) if not supplemental.empty else base
-            logger.info(
-                "Loaded %d countries from published geometry/global.csv plus %d supplemental Admin0 rows",
-                len(_GLOBAL_COUNTRIES_CACHE),
-                len(supplemental),
+            _GLOBAL_COUNTRIES_CACHE = _merge_supplemental(
+                pd.read_csv(StringIO(raw)), "published geometry/global.csv"
             )
             return _GLOBAL_COUNTRIES_CACHE
         except Exception as e:
             logger.warning("Failed to load global.csv from object storage: %s", e)
 
-    logger.warning(f"global.csv not found at {global_file}")
+    logger.warning(f"global.csv not available at {global_file}")
     return None
 
 
 def load_global_country_display_frame():
     """Load the bounded Admin0 Display artifact used by interactive maps.
 
-    Exact global geometry is a compatibility fallback only. Keeping this loader
+    This is the single Admin0 display helper. Every runtime surface that needs
+    a country shape, name, bounding box, or metadata column reads this frame,
+    and the Geometry Catalog overlay pairs it with
+    `geometry/geometry_catalog.json` for status facts. Exact global geometry is
+    a compatibility fallback for point containment only; keeping this loader
     separate prevents display simplification from leaking into spatial queries.
+
+    It resolves its lane through the same `resolve_artifact_read` ladder as the
+    exact bank, the country crosswalks, and the country JSON assets, so the
+    artifacts that describe one universe cannot end up on different lanes in
+    the same process.
     """
     global _GLOBAL_COUNTRY_DISPLAY_CACHE
     if _GLOBAL_COUNTRY_DISPLAY_CACHE is not None:
         return _GLOBAL_COUNTRY_DISPLAY_CACHE
 
     display_file = GEOMETRY_DIR / "display" / "admin_0.parquet"
+    lane = resolve_artifact_read(display_file)
     try:
-        if is_cloud_mode() and force_remote_data_reads():
-            raw = read_artifact_bytes("geometry/display/admin_0.parquet", lane="published")
-            base = pd.read_parquet(BytesIO(raw))
-        elif display_file.exists():
+        if lane == READ_LOCAL:
             base = pd.read_parquet(display_file)
-        elif is_cloud_mode():
+        elif lane == READ_REMOTE:
             raw = read_artifact_bytes("geometry/display/admin_0.parquet", lane="published")
             base = pd.read_parquet(BytesIO(raw))
         else:

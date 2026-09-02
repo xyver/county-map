@@ -9,6 +9,8 @@ requests. These tests pin the split so it does not drift back.
 
 import json
 import unittest
+import unittest.mock
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -159,6 +161,69 @@ class Admin0CountryUniverseTests(unittest.TestCase):
             universe = foundation_helpers._admin0_country_universe()
 
         self.assertEqual({"FRA"}, universe)
+
+
+class ArtifactReadLadderTests(unittest.TestCase):
+    """One lane decision for every helper artifact describing one universe.
+
+    The Admin0 Display bank, the exact Admin0 bank, the country crosswalks, and
+    the country JSON assets must not each decide independently which lane to
+    read, or a single process can serve a local display frame beside a
+    published spine.
+    """
+
+    def _resolve(self, *, exists: bool, forced_remote: bool, cloud: bool, prefer_local: bool) -> str:
+        path = unittest.mock.MagicMock()
+        path.exists.return_value = exists
+        with patch.object(foundation_helpers, "force_remote_data_reads", return_value=forced_remote),              patch.object(foundation_helpers, "is_cloud_mode", return_value=cloud),              patch.object(foundation_helpers, "prefer_local_geometry_reads", return_value=prefer_local):
+            return foundation_helpers.resolve_artifact_read(path)
+
+    def test_strict_cloud_override_ignores_a_local_artifact(self) -> None:
+        self.assertEqual(
+            foundation_helpers.READ_REMOTE,
+            self._resolve(exists=True, forced_remote=True, cloud=True, prefer_local=False),
+        )
+
+    def test_local_artifact_wins_when_no_override_is_set(self) -> None:
+        self.assertEqual(
+            foundation_helpers.READ_LOCAL,
+            self._resolve(exists=True, forced_remote=False, cloud=True, prefer_local=False),
+        )
+
+    def test_local_verification_posture_never_reaches_the_network(self) -> None:
+        self.assertEqual(
+            foundation_helpers.READ_UNAVAILABLE,
+            self._resolve(exists=False, forced_remote=False, cloud=False, prefer_local=True),
+        )
+
+    def test_cloud_mode_reads_published_when_no_local_artifact_exists(self) -> None:
+        self.assertEqual(
+            foundation_helpers.READ_REMOTE,
+            self._resolve(exists=False, forced_remote=False, cloud=True, prefer_local=False),
+        )
+
+    def test_no_local_artifact_and_no_cloud_is_unavailable(self) -> None:
+        self.assertEqual(
+            foundation_helpers.READ_UNAVAILABLE,
+            self._resolve(exists=False, forced_remote=False, cloud=False, prefer_local=False),
+        )
+
+    def test_every_helper_artifact_loader_uses_the_shared_ladder(self) -> None:
+        source = (
+            Path(foundation_helpers.__file__).read_text(encoding="utf-8")
+            .split("def resolve_artifact_read", 1)[1]
+        )
+        for loader in (
+            "def load_country_crosswalk",
+            "def load_country_json_asset",
+            "def load_global_countries_frame",
+            "def load_global_country_display_frame",
+        ):
+            body = source.split(loader, 1)[1].split("\ndef ", 1)[0]
+            self.assertIn(
+                "resolve_artifact_read(", body,
+                f"{loader} must resolve its lane through the shared ladder",
+            )
 
 
 class _SilentLogger:
