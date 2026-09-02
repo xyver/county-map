@@ -180,6 +180,36 @@ def _reference_country_codes() -> set[str]:
     return codes
 
 
+def _admin0_country_universe() -> set[str]:
+    """Admin0 identities the runtime recognizes, led by the Display bank.
+
+    The Geometry Catalog overlay is the true read of which countries exist and
+    how they are tracked, and it takes its shapes from
+    `geometry/display/admin_0.parquet` and its facts from
+    `geometry/geometry_catalog.json`. The exact bank follows that universe so a
+    territory added to the published Display bank is recognized here without a
+    second edit to the coverage reference.
+
+    `iso_codes.json` stays in the union as a floor. The Display loader fails
+    closed when its artifact is missing, and losing that read must not quietly
+    shrink exact Admin0 containment back to the territories the shallow global
+    bank folds into their parent country.
+    """
+    codes = _reference_country_codes()
+    try:
+        display = load_global_country_display_frame()
+    except Exception:
+        return codes
+    if display is None or display.empty or "loc_id" not in display.columns:
+        return codes
+    codes.update(
+        str(value).strip().upper()
+        for value in display["loc_id"].dropna()
+        if str(value).strip()
+    )
+    return codes
+
+
 def _load_supplemental_admin0_frame(
     existing_columns: list[str],
     existing_loc_ids: set[str],
@@ -210,7 +240,7 @@ def _load_supplemental_admin0_frame(
     if str(index.get("license_review_status") or "").strip().lower() != "approved" or not index.get("usable_for_derivation"):
         return pd.DataFrame(columns=existing_columns)
 
-    reference_codes = _reference_country_codes()
+    reference_codes = _admin0_country_universe()
     try:
         supplemental = (
             pd.read_parquet(BytesIO(read_artifact_bytes("geometry/supplemental/admin0_territories.parquet", lane="published")))

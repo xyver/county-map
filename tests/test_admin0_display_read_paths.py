@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from mapmover import geometry_handlers, preprocessor_geo
+from mapmover import foundation_helpers, geometry_handlers, preprocessor_geo
 from mapmover.runtime import loc_id_resolution
 
 
@@ -113,6 +113,52 @@ class Admin0DisplayReadPathTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
         self.assertEqual("HKG", match.get("loc_id"))
+
+
+class Admin0CountryUniverseTests(unittest.TestCase):
+    """The exact bank recognizes the universe the Geometry Catalog overlay shows.
+
+    The overlay takes shapes from geometry/display/admin_0.parquet and facts
+    from geometry/geometry_catalog.json. A territory published into that
+    Display bank should be admitted by the exact bank's supplemental merge
+    without a second edit to the coverage reference.
+    """
+
+    def test_display_universe_extends_the_reference_codes(self) -> None:
+        display = pd.DataFrame([{"loc_id": "NEWLAND"}, {"loc_id": "FRA"}])
+        with patch.object(
+            foundation_helpers, "_reference_country_codes", return_value={"FRA"}
+        ), patch.object(
+            foundation_helpers, "load_global_country_display_frame", return_value=display
+        ):
+            universe = foundation_helpers._admin0_country_universe()
+
+        self.assertIn("NEWLAND", universe)
+        self.assertIn("FRA", universe)
+
+    def test_missing_display_bank_falls_back_to_the_reference_codes(self) -> None:
+        # The Display loader fails closed. Losing that read must not shrink
+        # exact Admin0 containment.
+        with patch.object(
+            foundation_helpers, "_reference_country_codes", return_value={"FRA", "HKG"}
+        ), patch.object(
+            foundation_helpers, "load_global_country_display_frame", return_value=None
+        ):
+            universe = foundation_helpers._admin0_country_universe()
+
+        self.assertEqual({"FRA", "HKG"}, universe)
+
+    def test_display_read_failure_falls_back_to_the_reference_codes(self) -> None:
+        with patch.object(
+            foundation_helpers, "_reference_country_codes", return_value={"FRA"}
+        ), patch.object(
+            foundation_helpers,
+            "load_global_country_display_frame",
+            side_effect=RuntimeError("artifact unavailable"),
+        ):
+            universe = foundation_helpers._admin0_country_universe()
+
+        self.assertEqual({"FRA"}, universe)
 
 
 class _SilentLogger:
