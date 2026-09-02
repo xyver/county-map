@@ -913,6 +913,15 @@ def _geometry_catalog_countries(catalog: dict[str, Any], *, read_wip: bool = Fal
                 "publication_status": family.get("publication_status"),
                 "native_tier_names": family.get("native_tier_names") or [],
                 "gap_or_disposition": family.get("gap_or_disposition"),
+                "coverage_status": family.get("coverage_status") or "unknown",
+                "coverage_complete": bool(family.get("coverage_complete")),
+                "coverage_basis": family.get("coverage_basis"),
+                "coverage_denominator": family.get("coverage_denominator") or {},
+                "covered_jurisdictions": family.get("covered_jurisdictions") or [],
+                "unresolved_jurisdictions": family.get("unresolved_jurisdictions") or [],
+                "hierarchy_coverage_status": family.get("hierarchy_coverage_status"),
+                "hierarchy_coverage_complete": bool(family.get("hierarchy_coverage_complete")),
+                "hierarchy_node_count": family.get("hierarchy_node_count"),
             }
             for family in coverage.get("families") or []
             if isinstance(family, dict) and (read_wip or family.get("available") is True)
@@ -923,6 +932,10 @@ def _geometry_catalog_countries(catalog: dict[str, Any], *, read_wip: bool = Fal
             "release_version": profile.get("release_version"),
             "active_admin_depth": coverage.get("active_admin_depth") if coverage.get("active_admin_depth") is not None else (max(levels) if levels else None),
             "available_family_ids": list(coverage.get("available_family_ids") or []),
+            "complete_family_ids": list(coverage.get("complete_family_ids") or []),
+            "admin_hierarchy_coverage_status": coverage.get("admin_hierarchy_coverage_status"),
+            "admin_hierarchy_coverage_complete": bool(coverage.get("admin_hierarchy_coverage_complete")),
+            "admin_hierarchy_node_count": coverage.get("admin_hierarchy_node_count"),
             "families": families,
             "query_layout_available": bool(profile.get("query_layout_manifest")),
             "reference_graph_available": bool(profile.get("reference_graph_manifest")),

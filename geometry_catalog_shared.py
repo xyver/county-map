@@ -194,6 +194,12 @@ def build_published_geometry_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             for family in families
             if str(family.get("family_id") or "").strip()
         })
+        row["complete_family_ids"] = sorted({
+            str(family.get("family_id") or "").strip()
+            for family in families
+            if str(family.get("family_id") or "").strip()
+            and family.get("coverage_complete") is True
+        })
         coverage_rows.append(row)
     result["country_family_coverage"] = coverage_rows
     result = _without_candidate_fields(result)
@@ -252,6 +258,11 @@ def build_geometry_capability_summary(catalog: dict[str, Any]) -> dict[str, Any]
             for value in (item.get("available_family_ids") or [])
             if str(value).strip()
         })
+        complete_family_ids = sorted({
+            str(value).strip()
+            for value in (item.get("complete_family_ids") or [])
+            if str(value).strip()
+        })
         added_families = [value for value in family_ids if value != "administrative"]
         reasons = []
         if active_depth is not None and (baseline_depth is None or active_depth > baseline_depth):
@@ -265,6 +276,9 @@ def build_geometry_capability_summary(catalog: dict[str, Any]) -> dict[str, Any]
             "baseline_admin_depth": baseline_depth,
             "active_admin_depth": active_depth,
             "available_family_ids": family_ids,
+            "complete_family_ids": complete_family_ids,
+            "admin_hierarchy_coverage_status": item.get("admin_hierarchy_coverage_status"),
+            "admin_hierarchy_coverage_complete": bool(item.get("admin_hierarchy_coverage_complete")),
             "enrichment_reasons": reasons,
             "profile_id": profile.get("profile_id"),
             "release_status": profile.get("release_status"),

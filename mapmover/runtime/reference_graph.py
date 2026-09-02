@@ -385,14 +385,43 @@ def reference_graph_families() -> list[dict[str, Any]]:
     a family. This keeps MCP discovery current when one catalog activation adds
     a country or family, including in cloud mode where graph paths are virtual.
     """
+    catalog = load_geometry_catalog()
     catalog_families = {
         str(family_id).strip()
-        for country in load_geometry_catalog().get("country_family_coverage") or []
+        for country in catalog.get("country_family_coverage") or []
         if isinstance(country, dict)
         for family_id in country.get("available_family_ids") or []
         if str(family_id).strip()
     }
     totals = {family: 0 for family in catalog_families}
+    scope_by_family = {
+        family: {"available": set(), "complete": set(), "partial": set()}
+        for family in catalog_families
+    }
+    for country in catalog.get("country_family_coverage") or []:
+        if not isinstance(country, dict):
+            continue
+        country_code = str(country.get("country_code") or "").strip().upper()
+        if not country_code or country_code == "GLOBAL":
+            continue
+        for family_id in country.get("available_family_ids") or []:
+            family_id = str(family_id or "").strip()
+            if family_id in scope_by_family:
+                scope_by_family[family_id]["available"].add(country_code)
+                scope_by_family[family_id]["partial"].add(country_code)
+        for family in country.get("families") or []:
+            if not isinstance(family, dict) or family.get("available") is not True:
+                continue
+            family_id = str(family.get("family_id") or "").strip()
+            if family_id not in scope_by_family:
+                continue
+            scope_by_family[family_id]["available"].add(country_code)
+            complete = family.get("coverage_complete") is True
+            if family_id == "administrative":
+                complete = complete and family.get("hierarchy_coverage_complete") is True
+            if complete:
+                scope_by_family[family_id]["partial"].discard(country_code)
+                scope_by_family[family_id]["complete"].add(country_code)
     roots = list(reference_graph_roots().values())
     global_root = global_reference_graph_root()
     if global_root:
@@ -419,7 +448,13 @@ def reference_graph_families() -> list[dict[str, Any]]:
                 rows_count = 0
             totals[name] += rows_count
     return [
-        {"family": name, "identity_count": identity_count}
+        {
+            "family": name,
+            "identity_count": identity_count,
+            "available_country_codes": sorted(scope_by_family[name]["available"]),
+            "complete_country_codes": sorted(scope_by_family[name]["complete"]),
+            "partial_country_codes": sorted(scope_by_family[name]["partial"]),
+        }
         for name, identity_count in sorted(totals.items())
     ]
 

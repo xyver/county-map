@@ -131,12 +131,21 @@ def _family_card(family: dict[str, Any]) -> dict[str, Any]:
         "active_admin_depth": _as_int(family.get("active_admin_depth")),
         "candidate_admin_depth": _as_int(family.get("candidate_admin_depth")),
         "candidate_admin_status": family.get("candidate_admin_status"),
+        "coverage_status": family.get("coverage_status") or "unknown",
+        "coverage_complete": bool(family.get("coverage_complete")),
+        "coverage_basis": family.get("coverage_basis"),
+        "coverage_denominator": family.get("coverage_denominator") or {},
+        "hierarchy_coverage_status": family.get("hierarchy_coverage_status"),
+        "hierarchy_coverage_complete": bool(family.get("hierarchy_coverage_complete")),
+        "hierarchy_node_count": _as_int(family.get("hierarchy_node_count")),
     }
     for optional in (
         "source_releases",
         "source_licenses",
         "subtypes",
         "covered_jurisdictions",
+        "unresolved_jurisdictions",
+        "terminal_empty_or_not_applicable_jurisdictions",
         "candidate_admin_source_releases",
         "candidate_admin_source_licenses",
     ):
@@ -162,6 +171,12 @@ def _program_card(row: dict[str, Any]) -> dict[str, Any]:
         "available_family_ids": [
             str(value) for value in (row.get("available_family_ids") or [])
         ],
+        "complete_family_ids": [
+            str(value) for value in (row.get("complete_family_ids") or [])
+        ],
+        "admin_hierarchy_coverage_status": row.get("admin_hierarchy_coverage_status"),
+        "admin_hierarchy_coverage_complete": bool(row.get("admin_hierarchy_coverage_complete")),
+        "admin_hierarchy_node_count": _as_int(row.get("admin_hierarchy_node_count")),
         "max_admin_level": _as_int(row.get("max_admin_level")),
         "active_admin_depth": _as_int(row.get("active_admin_depth")),
         "candidate_admin_depth": _as_int(row.get("candidate_admin_depth")),
@@ -268,7 +283,13 @@ def country_capability_record(catalog: dict[str, Any], country_scope: str) -> di
     available_families = [
         {
             key: family.get(key)
-            for key in ("family_id", "label", "short_label", "description")
+            for key in (
+                "family_id", "label", "short_label", "description",
+                "coverage_status", "coverage_complete", "coverage_basis",
+                "coverage_denominator", "hierarchy_coverage_status",
+                "hierarchy_coverage_complete", "hierarchy_node_count",
+                "covered_jurisdictions", "unresolved_jurisdictions",
+            )
             if family.get(key) not in (None, "")
         }
         for family in program.get("families") or []
@@ -304,6 +325,10 @@ def country_capability_record(catalog: dict[str, Any], country_scope: str) -> di
         "release_version": profile.get("release_version"),
         "active_admin_depth": active_depth,
         "available_family_ids": available_family_ids,
+        "complete_family_ids": list(program.get("complete_family_ids") or []),
+        "admin_hierarchy_coverage_status": program.get("admin_hierarchy_coverage_status"),
+        "admin_hierarchy_coverage_complete": bool(program.get("admin_hierarchy_coverage_complete")),
+        "admin_hierarchy_node_count": _as_int(program.get("admin_hierarchy_node_count")),
         "families": available_families,
         "query_layout_available": has_country_layout,
         "reference_graph_available": bool(profile.get("reference_graph_manifest")),
@@ -418,7 +443,12 @@ def _public_family_card(family: dict[str, Any]) -> dict[str, Any] | None:
         return None
     return {
         key: family.get(key)
-        for key in ("family_id", "label", "short_label", "description")
+        for key in (
+            "family_id", "label", "short_label", "description",
+            "coverage_status", "coverage_complete", "coverage_basis",
+            "coverage_denominator", "hierarchy_coverage_status",
+            "hierarchy_coverage_complete", "hierarchy_node_count",
+        )
         if family.get(key) not in (None, "")
     } | {"available": True}
 

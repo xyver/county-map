@@ -1040,11 +1040,19 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
                     "country_code": "NZL",
                     "active_admin_depth": 3,
                     "available_family_ids": ["administrative", "place_or_municipality"],
+                    "complete_family_ids": ["administrative"],
+                    "admin_hierarchy_coverage_status": "complete",
+                    "admin_hierarchy_coverage_complete": True,
+                    "admin_hierarchy_node_count": 1234,
                     "families": [{
                         "family_id": "place_or_municipality",
                         "label": "Places",
                         "available": True,
                         "publication_status": "published",
+                        "coverage_status": "partial",
+                        "coverage_complete": False,
+                        "coverage_basis": "partial_children",
+                        "unresolved_jurisdictions": ["STL"],
                     }],
                 }],
             },
@@ -1061,6 +1069,10 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         )
         self.assertTrue(payload["countries"][0]["query_layout_available"])
         self.assertTrue(payload["countries"][0]["reference_graph_available"])
+        self.assertEqual(payload["countries"][0]["complete_family_ids"], ["administrative"])
+        self.assertTrue(payload["countries"][0]["admin_hierarchy_coverage_complete"])
+        self.assertEqual(payload["countries"][0]["families"][0]["coverage_status"], "partial")
+        self.assertEqual(payload["countries"][0]["families"][0]["unresolved_jurisdictions"], ["STL"])
 
     def test_read_geometry_catalog_full_view_does_not_expose_internal_country_candidates(self) -> None:
         with mock.patch(

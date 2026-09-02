@@ -37,11 +37,21 @@ def _catalog() -> dict:
             "available_family_ids": [
                 "administrative", "place_or_municipality", "urban_or_metro_area",
             ],
+            "complete_family_ids": ["administrative"],
+            "admin_hierarchy_coverage_status": "complete",
+            "admin_hierarchy_coverage_complete": True,
+            "admin_hierarchy_node_count": 100,
             "families": [{
                 "family_id": "administrative",
                 "label": "Administrative hierarchy",
                 "available": True,
                 "publication_status": "published",
+                "coverage_status": "complete",
+                "coverage_complete": True,
+                "coverage_basis": "complete_children",
+                "hierarchy_coverage_status": "complete",
+                "hierarchy_coverage_complete": True,
+                "hierarchy_node_count": 100,
             }],
         }],
     }
@@ -62,6 +72,9 @@ class GeometryCountryCapabilityTests(unittest.TestCase):
         self.assertEqual(country["query_guidance"]["shallow_admin_levels"], [0, 1, 2, 3])
         self.assertEqual(country["query_guidance"]["deep_admin_levels"], [4, 5, 6])
         self.assertEqual(country["query_guidance"]["deep_partition_owner_level"], 1)
+        self.assertEqual(country["complete_family_ids"], ["administrative"])
+        self.assertTrue(country["admin_hierarchy_coverage_complete"])
+        self.assertTrue(country["families"][0]["coverage_complete"])
 
     def test_catalog_capability_view_supports_baseline_only_country(self) -> None:
         with mock.patch(

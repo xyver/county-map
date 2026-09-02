@@ -82,8 +82,16 @@ def test_cloud_reference_family_discovery_is_catalog_owned(tmp_path: Path) -> No
         families = reference_graph.reference_graph_families()
 
     assert families == [
-        {"family": "administrative", "identity_count": 0},
-        {"family": "place_or_municipality", "identity_count": 123},
+        {
+            "family": "administrative", "identity_count": 0,
+            "available_country_codes": ["NZL"], "complete_country_codes": [],
+            "partial_country_codes": ["NZL"],
+        },
+        {
+            "family": "place_or_municipality", "identity_count": 123,
+            "available_country_codes": ["NZL"], "complete_country_codes": [],
+            "partial_country_codes": ["NZL"],
+        },
     ]
     reader.assert_called_once_with(root / "identity_partitions.parquet", columns=["family", "row_count"])
 

@@ -154,7 +154,11 @@ def test_downloadable_projection_filters_wip_records_and_unavailable_families() 
             "country_code": "USA",
             "candidate_admin_depth": 5,
             "families": [
-                {"family_id": "administrative", "available": True, "state": "published"},
+                {
+                    "family_id": "administrative", "available": True,
+                    "state": "published", "coverage_status": "complete",
+                    "coverage_complete": True,
+                },
                 {"family_id": "watershed", "available": False, "state": "researching"},
             ],
         }],
@@ -171,7 +175,9 @@ def test_downloadable_projection_filters_wip_records_and_unavailable_families() 
     assert [item["country_code"] for item in published["country_profiles"]] == ["USA"]
     coverage = published["country_family_coverage"][0]
     assert coverage["available_family_ids"] == ["administrative"]
+    assert coverage["complete_family_ids"] == ["administrative"]
     assert [item["family_id"] for item in coverage["families"]] == ["administrative"]
+    assert coverage["families"][0]["coverage_status"] == "complete"
     assert "candidate_admin_depth" not in coverage
 
 
