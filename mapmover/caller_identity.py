@@ -61,7 +61,13 @@ TIER_PAID = "paid"
 # Plans that resolve to the paid tier. Billing owns which plan a user has; the
 # runtime only reads it. "master" is the internal/admin plan and is included so
 # operator traffic is never throttled below a customer.
-PAID_PLAN_IDS: frozenset[str] = frozenset({"plus", "pro", "master"})
+#
+# These ids must exist in the `plans` table. The set is a compatibility default
+# and should be replaced by a `plans.access_tier` column so the ladder is data
+# rather than code; the previous hardcoded map had drifted to name a "plus"
+# plan that does not exist, which silently demoted real plans to the account
+# tier.
+PAID_PLAN_IDS: frozenset[str] = frozenset({"pro", "enterprise", "master"})
 
 # Cookie carrying a server-issued anonymous session id. High entropy so it
 # cannot be guessed, and server-issued so a caller cannot pick their own bucket.

@@ -755,6 +755,10 @@ def _tool_env_suffix(tool_name: str) -> str:
 # plan_id lives on the account/control plane (Stripe); the runtime only reads
 # the verified plan. This is generic - any rate-limited free tool inherits the
 # tiering, not a geography-specific path.
+#
+# "plus" here is a rate-tier name, not a plan id. It is the existing env
+# contract (MCP_TOOL_RATE_LIMIT_PLUS) and is deliberately kept; which plans
+# reach it is decided by PAID_PLAN_IDS in caller_identity.
 TOOL_RATE_TIER_BY_ACCESS_TIER: dict[str, str] = {
     TIER_ANONYMOUS: "free",
     TIER_ACCOUNT: "account",

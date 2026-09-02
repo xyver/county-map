@@ -191,8 +191,18 @@ class AccessTierTests(unittest.TestCase):
             ),
             (
                 "account on a paid plan",
-                CallerIdentity(KIND_ACCOUNT, "u2", CONFIDENCE_VERIFIED, auth_user_id="u2", plan_id="plus"),
+                CallerIdentity(KIND_ACCOUNT, "u2", CONFIDENCE_VERIFIED, auth_user_id="u2", plan_id="pro"),
                 TIER_PAID,
+            ),
+            (
+                "account on an enterprise plan",
+                CallerIdentity(KIND_ACCOUNT, "u3", CONFIDENCE_VERIFIED, auth_user_id="u3", plan_id="enterprise"),
+                TIER_PAID,
+            ),
+            (
+                "account on an unknown plan fails safe to account",
+                CallerIdentity(KIND_ACCOUNT, "u4", CONFIDENCE_VERIFIED, auth_user_id="u4", plan_id="nonexistent"),
+                TIER_ACCOUNT,
             ),
         ]:
             with self.subTest(label):
@@ -206,7 +216,7 @@ class AccessTierTests(unittest.TestCase):
 
     def test_signing_up_does_not_grant_the_paid_ceiling(self) -> None:
         account = CallerIdentity(KIND_ACCOUNT, "u1", CONFIDENCE_VERIFIED, auth_user_id="u1")
-        paid = CallerIdentity(KIND_ACCOUNT, "u2", CONFIDENCE_VERIFIED, auth_user_id="u2", plan_id="plus")
+        paid = CallerIdentity(KIND_ACCOUNT, "u2", CONFIDENCE_VERIFIED, auth_user_id="u2", plan_id="pro")
         self.assertEqual(account.included_item_lane, "account")
         self.assertEqual(paid.included_item_lane, "paid")
 
