@@ -321,6 +321,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         self.assertEqual(info["name"], "Butte precinct")
         self.assertEqual(info["family"], "admin_local")
+        self.assertEqual(info["iso3"], "USA")
         graph_mock.assert_not_called()
         family_mock.assert_not_called()
 

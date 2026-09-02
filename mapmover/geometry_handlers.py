@@ -2340,6 +2340,17 @@ def get_location_info(loc_id: str, *, include_memberships: bool = True):
 
     iso3 = parts[0]
     inferred_admin_level = infer_admin_level_from_loc_id(loc_id)
+    namespace_family = classify_loc_id_family(loc_id)
+    if (
+        not admin_spine_layout_available(iso3)
+        or (namespace_family and not str(namespace_family).startswith("admin"))
+    ):
+        graph_info = _reference_graph_location_info(loc_id)
+        if graph_info and not str(graph_info.get("family") or "").startswith("admin"):
+            # A declared sidechain namespace belongs to the reference graph.
+            # Do not let an admin-depth-looking identifier hydrate a geometry
+            # metadata row first and thereby lose graph identity fields.
+            return graph_info
     if inferred_admin_level is not None:
         metadata = _get_selection_metadata_for_loc_id(loc_id)
         if metadata:
@@ -2658,7 +2669,10 @@ def _build_metadata_based_location_info(
         "centroid": {"lon": props.get("centroid_lon"), "lat": props.get("centroid_lat")},
         "bbox": _bbox_from_feature_props(props),
         "has_polygon": bool(props.get("has_polygon")),
-        "iso3": props.get("iso_a3"),
+        # Sidechain geometry metadata does not always repeat the country
+        # column. loc_id owns the country namespace, so preserve the stable
+        # response contract without forcing a second graph lookup.
+        "iso3": props.get("iso_a3") or str(props.get("loc_id") or loc_id).split("-", 1)[0],
         "land_area": props.get("land_area"),
         "water_area": props.get("water_area"),
         "geometry_source": props.get("geometry_source"),
