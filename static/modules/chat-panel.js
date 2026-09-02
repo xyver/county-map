@@ -3923,6 +3923,22 @@ export const ChatManager = {
         throw new Error('maps_key_missing');
       }
 
+      // Google calls this hook for key/auth/quota rejections after the library
+      // loads. Without it the card reports "not configured yet" for a key that
+      // is configured correctly but restricted or out of quota, which is the
+      // most confusing failure this feature has. Quota values and where to
+      // change them are recorded in county-map-private/docs/security.md,
+      // section "Google Maps key exposure and address-card rate limiting".
+      window.gm_authFailure = () => {
+        this.googleMapsAuthFailed = true;
+        document.querySelectorAll('.address-prompt-status').forEach((el) => {
+          el.textContent =
+            'Address search was rejected by Google. This is usually the daily or '
+            + 'per-minute Places quota, or the API key website restrictions. '
+            + 'Check the browser console for the exact Maps error code.';
+        });
+      };
+
       await new Promise((resolve, reject) => {
         const existing = document.querySelector('script[data-google-maps-places="true"]');
         if (existing) {
