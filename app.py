@@ -635,7 +635,45 @@ async def llms_txt():
 
 
 @app.get("/api/config/maps-key", include_in_schema=False)
-async def maps_key_config():
+async def maps_key_config(request: Request):
+    """Hand the browser the Google Maps key for the address card.
+
+    This endpoint gives away a credential by design: client-side Places has to
+    run in the page, so the key is public to anyone who loads the app. The
+    limiter below is defense in depth against a scripted fetch loop and against
+    the address card being driven in a tight loop; it is NOT what protects the
+    key. Once a caller holds the key they call Google directly and never touch
+    this process again, so the only real controls are the referrer/API
+    restrictions and the quota caps set on the key in Google Cloud.
+
+    Every call is already recorded by the route-analytics middleware with a
+    hashed IP, the account id when signed in, and a timestamp. The address text
+    is never sent here - Autocomplete runs browser-to-Google - so there is
+    nothing address-shaped to store.
+    """
+    client_ip = get_client_ip(request)
+    limit = int(os.getenv("MAPS_KEY_RATE_LIMIT", "1"))
+    window_seconds = int(os.getenv("MAPS_KEY_RATE_WINDOW_SECONDS", "5"))
+    allowed, retry_after = rate_limiter.check(
+        f"maps_key:ip:{client_ip}",
+        limit=limit,
+        window_seconds=window_seconds,
+    )
+
+    request.state.analytics_metadata = {
+        **(getattr(request.state, "analytics_metadata", None) or {}),
+        "tool": "address_autocomplete",
+        "config_key": "google_maps",
+    }
+
+    if not allowed:
+        request.state.analytics_error_code = "maps_key_rate_limited"
+        return JSONResponse(
+            {"error": "Too many address lookups. Please wait a moment and try again."},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
     return JSONResponse({"key": os.getenv("GOOGLE_MAPS_API_KEY", "").strip()})
 
 

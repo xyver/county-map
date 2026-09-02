@@ -165,6 +165,15 @@ _MCP_SCANNER_METHODS = frozenset({
 })
 
 
+# Paths whose successful calls are mirrored to the control plane. Each one
+# either spends money with an outside provider or releases a credential, and
+# each carries its own low rate-limit ceiling, so the volume stays small and the
+# signal is "someone used this", not "the browser polled again".
+_METERED_CONFIG_PATHS = frozenset({
+    "/api/config/maps-key",
+})
+
+
 def _should_mirror_route_event_to_control_plane(
     path: str | None,
     method: str | None = None,
@@ -188,6 +197,13 @@ def _should_mirror_route_event_to_control_plane(
         if rate_limited or error_code or (status_code and status_code >= 400):
             return True
         # Log actual tool calls and anything else not filtered above
+        return True
+
+    # Narrow exception to the rule below: a handful of paths bill a third party
+    # or hand out a credential, so a successful call is itself the event worth
+    # keeping. They are rate limited to a low ceiling, so they cannot become the
+    # routine-polling problem that emptied this table of signal in 2026-07.
+    if path in _METERED_CONFIG_PATHS:
         return True
 
     # Non-MCP surfaces: security_events is the violations/errors record

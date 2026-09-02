@@ -3887,7 +3887,12 @@ export const ChatManager = {
       input.focus();
     } catch (error) {
       console.warn('Address autocomplete unavailable:', error);
-      status.textContent = 'Address autocomplete is not configured yet. Add a Google Maps API key to enable it.';
+      if (error?.message === 'maps_key_rate_limited') {
+        const wait = error.retryAfterSeconds || 5;
+        status.textContent = `Too many address lookups just now. Try again in ${wait} second${wait === 1 ? '' : 's'}.`;
+      } else {
+        status.textContent = 'Address autocomplete is not configured yet. Add a Google Maps API key to enable it.';
+      }
     }
   },
 
@@ -3903,6 +3908,12 @@ export const ChatManager = {
       const response = await fetch('/api/config/maps-key', {
         headers: { Accept: 'application/json' }
       });
+      if (response.status === 429) {
+        const retryAfter = Number(response.headers.get('Retry-After')) || 5;
+        const error = new Error('maps_key_rate_limited');
+        error.retryAfterSeconds = retryAfter;
+        throw error;
+      }
       if (!response.ok) {
         throw new Error(`maps_key_request_failed_${response.status}`);
       }
