@@ -188,6 +188,8 @@ def _normalized_row(
         "name": row.get("name") or row.get("name_en") or identity.get("name"),
         "name_local": row.get("name_fr"),
         "family": row.get("family") or identity.get("family"),
+        "subtype": row.get("subtype") or identity.get("subtype") or identity.get("source_native_subtype"),
+        "source_native_subtype": identity.get("source_native_subtype"),
         "admin_level": identity.get("admin_level"),
         "parent_id": identity.get("parent_loc_id"),
         "centroid_lon": float(centroid.x),

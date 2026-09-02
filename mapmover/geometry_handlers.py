@@ -109,6 +109,8 @@ POINT_RESOLUTION_COLUMNS.append("geometry")
 
 GEOMETRY_METADATA_COLUMNS = list(GEOMETRY_INDEX_COLUMNS)
 GEOMETRY_METADATA_COLUMNS.extend([
+    "subtype",
+    "source_native_subtype",
     "children_count",
     "children_by_level",
     "descendants_count",
@@ -2658,6 +2660,7 @@ def _build_metadata_based_location_info(
         "admin_level": props.get("admin_level"),
         "parent_id": props.get("parent_id"),
         "family": family,
+        "subtype": props.get("subtype") or props.get("source_native_subtype"),
         "children_count": props.get("children_count") or 0,
         "children_by_level": props.get("children_by_level", "{}"),
         "descendants_count": props.get("descendants_count") or 0,
@@ -2718,6 +2721,7 @@ def _build_feature_based_location_info(loc_id: str, feature: dict) -> dict:
         "admin_level": props.get("admin_level"),
         "parent_id": props.get("parent_id"),
         "family": family,
+        "subtype": props.get("subtype") or props.get("source_native_subtype"),
         "children_count": props.get("children_count") or 0,
         "children_by_level": props.get("children_by_level", "{}"),
         "descendants_count": props.get("descendants_count") or 0,
@@ -3668,6 +3672,8 @@ def _geometry_metadata_row(row) -> dict:
         "loc_id": row.get("local_loc_id") or row.get("loc_id"),
         "source_loc_id": row.get("source_loc_id"),
         "name": row.get("name"),
+        "subtype": _geometry_metadata_value(row, "subtype", "source_native_subtype"),
+        "source_native_subtype": row.get("source_native_subtype"),
         "admin_level": row.get("admin_level"),
         "parent_id": row.get("parent_id"),
         "centroid_lon": row.get("centroid_lon"),

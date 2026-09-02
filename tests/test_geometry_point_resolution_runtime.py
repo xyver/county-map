@@ -310,6 +310,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
             "parent_id": "",
             "admin_level": 5,
             "name": "Butte precinct",
+            "subtype": "voting_district",
             "has_polygon": True,
         }
         with (
@@ -321,6 +322,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         self.assertEqual(info["name"], "Butte precinct")
         self.assertEqual(info["family"], "admin_local")
+        self.assertEqual(info["subtype"], "voting_district")
         self.assertEqual(info["iso3"], "USA")
         graph_mock.assert_not_called()
         family_mock.assert_not_called()

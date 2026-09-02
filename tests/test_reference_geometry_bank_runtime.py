@@ -58,6 +58,7 @@ class ReferenceGeometryBankRuntimeTests(unittest.TestCase):
             "geometry_bank": "geometry/countries/CAN/relationships/example",
             "has_shape": True,
             "family": "can_designated_place",
+            "source_native_subtype": "designated_place",
             "name": "Example",
         }]
         version_rows = pd.DataFrame([{
@@ -88,6 +89,7 @@ class ReferenceGeometryBankRuntimeTests(unittest.TestCase):
         self.assertEqual(len(frame), 1)
         self.assertEqual(frame.iloc[0]["loc_id"], canonical_id)
         self.assertEqual(frame.iloc[0]["name"], "Example")
+        self.assertEqual(frame.iloc[0]["subtype"], "designated_place")
         self.assertEqual(frame.iloc[0]["geometry"]["type"], "Polygon")
 
     def test_projected_geoparquet_shape_is_normalized_to_wgs84(self):

@@ -777,6 +777,7 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
                     "admin_level": 2,
                     "parent_id": "USA-AK",
                     "family": "admin",
+                    "subtype": "county_and_equivalent",
                     "iso3": "USA",
                     "centroid": {"lon": -140, "lat": 59},
                     "bbox": [-142, 58, -138, 60],
@@ -802,6 +803,7 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
 
         references_mock.assert_called_once()
         self.assertEqual(payload["loc_id"], "USA-AK-282")
+        self.assertEqual(payload["subtype"], "county_and_equivalent")
         self.assertEqual(payload["source_vintage"], "2021")
         self.assertEqual(payload["release_id"], "test-release-2021")
         self.assertEqual(payload["reference_count"], 1)

@@ -2702,6 +2702,7 @@ def _loc_id_info_item(loc_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "admin_level": info.get("admin_level"),
         "parent_id": info.get("parent_id"),
         "family": info.get("family"),
+        "subtype": info.get("subtype"),
         "iso3": info.get("iso3"),
         "centroid": info.get("centroid"),
         "bbox": info.get("bbox"),
