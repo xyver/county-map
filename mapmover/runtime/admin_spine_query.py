@@ -123,6 +123,46 @@ def _metadata(connection, path: Path, lon: float, lat: float,
     """, parameters).fetchall()
 
 
+def _metadata_with_geometry(connection, path: Path, lon: float, lat: float,
+                            admin3: str = "") -> list[tuple]:
+    """Return bbox candidates and their shapes in one object-store read.
+
+    The old resolver queried a file once for metadata and then reopened the
+    same file to fetch WKB for those candidate IDs.  On an unsorted remote
+    shard the second ``loc_id IN`` query can scan nearly every row group again.
+    Keep the bbox/owner predicate and exact Shapely test, but project WKB in
+    this same read so the candidate scan is not duplicated.
+    """
+    owner_clause = "" if not admin3 else " AND admin_3_loc_id = ?"
+    parameters: list[Any] = [path_to_uri(path), lon, lon, lat, lat]
+    if admin3:
+        parameters.append(admin3)
+    return connection.execute(f"""
+        SELECT {META_COLUMNS}, ST_AsWKB(geometry) AS geometry_wkb
+        FROM read_parquet(?)
+        WHERE bbox_max_lon >= ? AND bbox_min_lon <= ?
+          AND bbox_max_lat >= ? AND bbox_min_lat <= ? {owner_clause}
+        ORDER BY admin_level, loc_id
+    """, parameters).fetchall()
+
+
+def _exact_candidate_rows(rows: list[tuple], lon: float, lat: float) -> list[tuple[tuple, bytes, float]]:
+    """Apply the exact point-in-polygon check to shape-bearing candidates."""
+    point = Point(lon, lat)
+    matches = []
+    for candidate in rows:
+        if not candidate:
+            continue
+        row = tuple(candidate[:-1])
+        geometry_wkb = candidate[-1]
+        if geometry_wkb is None:
+            continue
+        geometry = from_wkb(bytes(geometry_wkb))
+        if geometry.covers(point):
+            matches.append((row, bytes(geometry_wkb), float(geometry.area)))
+    return matches
+
+
 def _exact_rows(connection, path: Path, rows: list[tuple],
                 lon: float, lat: float) -> list[tuple[tuple, bytes, float]]:
     if not rows:
@@ -165,8 +205,10 @@ def resolve_point(
     root = layout_root(iso3)
     connection = _connection()
     try:
-        shallow_meta = _metadata(connection, root / "admin_0_3.parquet", lon, lat)
-        shallow = _exact_rows(connection, root / "admin_0_3.parquet", shallow_meta, lon, lat)
+        shallow_candidates = _metadata_with_geometry(
+            connection, root / "admin_0_3.parquet", lon, lat,
+        )
+        shallow = _exact_candidate_rows(shallow_candidates, lon, lat)
         if not shallow:
             return None
         shallow.sort(key=lambda item: (int(item[0][2]), -item[2], str(item[0][0])))
@@ -179,8 +221,10 @@ def resolve_point(
         deep_path = root / "deep" / f"{admin1}.parquet"
         needs_deep = target_admin_level is None or int(target_admin_level) > 3
         if needs_deep and admin3 and (is_cloud_mode() or deep_path.is_file()):
-            deep_meta = _metadata(connection, deep_path, lon, lat, admin3)
-            deep = _exact_rows(connection, deep_path, deep_meta, lon, lat)
+            deep_candidates = _metadata_with_geometry(
+                connection, deep_path, lon, lat, admin3,
+            )
+            deep = _exact_candidate_rows(deep_candidates, lon, lat)
             deep.sort(key=lambda item: (int(item[0][2]), -item[2], str(item[0][0])))
         all_matches = [shallow_by_level[level] for level in sorted(shallow_by_level)] + deep
         by_level: dict[int, tuple[tuple, bytes, float]] = {}
@@ -193,7 +237,7 @@ def resolve_point(
             "stack": [_row_dict(item[0]) for item in ordered],
             "matched": _row_dict(final[0]),
             "geometry_wkb": final[1],
-            "shallow_candidate_count": len(shallow_meta),
+            "shallow_candidate_count": len(shallow_candidates),
             "deep_candidate_count": len(deep) if deep else 0,
             "query_layout": True,
         }

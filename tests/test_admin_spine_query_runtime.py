@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+from shapely.geometry import Polygon
 
 from mapmover.runtime import admin_spine_query
 
@@ -182,3 +183,77 @@ def test_modern_layout_fails_closed_when_route_index_is_unreadable() -> None:
         )
 
     assert result.empty
+
+
+def test_point_resolve_reads_each_layout_file_once_with_exact_shape_check() -> None:
+    """The point resolver must not reopen a remote shard for WKB by loc_id."""
+    names = [part.strip() for part in admin_spine_query.META_COLUMNS.replace("\n", " ").split(",")]
+    square_wkb = Polygon([(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)]).wkb
+
+    def row(loc_id: str, level: int, parent: str = "", admin3: str = "") -> tuple:
+        admin3 = admin3 or (loc_id if level == 3 else "")
+        values = {name: "" for name in names}
+        values.update({
+            "loc_id": loc_id,
+            "parent_id": parent,
+            "admin_level": level,
+            "name": loc_id,
+            "admin_0_loc_id": "USA",
+            "admin_1_loc_id": "USA-CA" if level else "",
+            "admin_2_loc_id": "USA-CA-037" if level >= 2 else "",
+            "admin_3_loc_id": admin3,
+            "bbox_min_lon": 0.0,
+            "bbox_min_lat": 0.0,
+            "bbox_max_lon": 10.0,
+            "bbox_max_lat": 10.0,
+        })
+        return tuple(values[name] for name in names) + (square_wkb,)
+
+    shallow_rows = [
+        row("USA", 0),
+        row("USA-CA", 1, "USA"),
+        row("USA-CA-037", 2, "USA-CA"),
+        row("USA-CA-037-207400", 3, "USA-CA-037"),
+    ]
+    deep_rows = [
+        row("USA-CA-037-207400-1", 4, "USA-CA-037-207400", "USA-CA-037-207400"),
+        row("USA-CA-037-207400-1-024", 5, "USA-CA-037-207400-1", "USA-CA-037-207400"),
+    ]
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, parameters):
+            self.calls.append((sql, parameters))
+            return Result(deep_rows if "deep/USA-CA.parquet" in str(parameters[0]) else shallow_rows)
+
+        def close(self):
+            pass
+
+    connection = Connection()
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "is_cloud_mode", return_value=True),
+        patch.object(admin_spine_query, "path_to_uri", side_effect=lambda path: path.as_posix()),
+        patch.object(admin_spine_query, "_connection", return_value=connection),
+        patch.object(admin_spine_query, "_exact_rows", side_effect=AssertionError("duplicate shape scan")),
+    ):
+        result = admin_spine_query.resolve_point("USA", 5.0, 5.0, target_admin_level=5)
+
+    assert [item["loc_id"] for item in result["stack"]] == [
+        "USA", "USA-CA", "USA-CA-037", "USA-CA-037-207400",
+        "USA-CA-037-207400-1", "USA-CA-037-207400-1-024",
+    ]
+    assert result["matched"]["loc_id"] == "USA-CA-037-207400-1-024"
+    assert len(connection.calls) == 2
+    assert all("ST_AsWKB(geometry)" in sql for sql, _ in connection.calls)
+    assert all("WHERE loc_id IN" not in sql for sql, _ in connection.calls)
