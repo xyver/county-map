@@ -40,7 +40,11 @@ class MCPExecutionTimeoutError(TimeoutError):
 
 
 _MAX_WORKERS = _env_int("MCP_EXECUTION_MAX_WORKERS", 2)
-_DEFAULT_TIMEOUT_SECONDS = _env_int("MCP_EXECUTION_TIMEOUT_SECONDS", 20)
+# Full country reference graphs can require roughly a minute for the first
+# object-store/DuckDB read.  Keep the response budget aligned with the cloud
+# geography smoke while retaining the bounded worker pool and fail-fast
+# capacity guard; timed-out work still holds its slot until it really exits.
+_DEFAULT_TIMEOUT_SECONDS = _env_int("MCP_EXECUTION_TIMEOUT_SECONDS", 120)
 _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="mcp-tool")
 _CAPACITY = threading.BoundedSemaphore(_MAX_WORKERS)
 
