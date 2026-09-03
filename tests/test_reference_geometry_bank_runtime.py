@@ -13,6 +13,8 @@ from shapely.ops import transform as transform_geometry
 
 from mapmover.paths import DATA_ROOT
 from mapmover.runtime.reference_geometry_bank import (
+    _geoparquet_crs,
+    _parquet_geometry_type,
     _read_single_file_bank,
     _safe_bank_root,
     _safe_partition_path,
@@ -27,6 +29,43 @@ CANADA_DB_BANK = DATA_ROOT / "geometry" / "countries" / "CAN" / "dissemination_b
 
 
 class ReferenceGeometryBankRuntimeTests(unittest.TestCase):
+    def tearDown(self):
+        _geoparquet_crs.cache_clear()
+
+    def test_remote_geometry_metadata_uses_resolved_uri_not_logical_local_path(self):
+        geo_metadata = json.dumps({
+            "primary_column": "geometry",
+            "columns": {"geometry": {"crs": CRS.from_epsg(4326).to_json_dict()}},
+        }).encode("utf-8")
+        logical_path = Path("/tmp/DaedalMap/data/geometry/countries/CAN/deep/CAN-BC.parquet")
+        remote_uri = "s3://bucket/published/geometry/countries/CAN/deep/CAN-BC.parquet"
+        with (
+            patch("mapmover.runtime.reference_geometry_bank.path_to_uri", return_value=remote_uri),
+            patch(
+                "mapmover.runtime.reference_geometry_bank.run_df",
+                return_value=pd.DataFrame([{"value": geo_metadata}]),
+            ) as run_df,
+        ):
+            crs = _geoparquet_crs(str(logical_path))
+
+        self.assertTrue(crs.equals(CRS.from_epsg(4326)))
+        self.assertEqual(run_df.call_args.args[1][0], remote_uri)
+
+    def test_remote_geometry_type_uses_resolved_uri_not_pyarrow_local_open(self):
+        logical_path = Path("/tmp/DaedalMap/data/geometry/countries/CAN/deep/CAN-BC.parquet")
+        remote_uri = "s3://bucket/published/geometry/countries/CAN/deep/CAN-BC.parquet"
+        with (
+            patch("mapmover.runtime.reference_geometry_bank.path_to_uri", return_value=remote_uri),
+            patch(
+                "mapmover.runtime.reference_geometry_bank.run_df",
+                return_value=pd.DataFrame([{"duckdb_type": "BLOB"}]),
+            ) as run_df,
+        ):
+            geometry_type = _parquet_geometry_type(logical_path)
+
+        self.assertEqual(geometry_type, "BLOB")
+        self.assertEqual(run_df.call_args.args[1][0], remote_uri)
+
     def test_remote_geoparquet_extension_conversion_falls_back_to_wkb_reader(self):
         expected = pd.DataFrame([{"loc_id": "CAN-BC-TEST", "__geometry_wkb": b"shape"}])
         with (

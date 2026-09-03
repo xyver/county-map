@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from pyproj import CRS, Transformer
 from pyproj.exceptions import ProjError
 from shapely.geometry import mapping, shape
@@ -32,15 +30,43 @@ DIRECT_ADMIN_PARTITION_BANKS = {"dissemination_area", "dissemination_block", "de
 
 @lru_cache(maxsize=256)
 def _geoparquet_crs(path_text: str) -> CRS | None:
-    """Return the declared primary-geometry CRS, if locally readable."""
+    """Return the declared primary-geometry CRS through the DuckDB read path.
+
+    Geometry-bank paths are logical DATA_ROOT paths.  In hosted mode the
+    corresponding file normally exists only in object storage, so opening the
+    logical path with PyArrow races temporary hydration or fails outright.
+    DuckDB's parquet metadata function follows the same stable local-cache or
+    S3 URI selected for the actual filtered geometry query.
+    """
     try:
-        metadata = pq.ParquetFile(Path(path_text)).schema_arrow.metadata or {}
-        payload = json.loads(metadata.get(b"geo", b"{}").decode("utf-8"))
+        uri = path_to_uri(Path(path_text))
+        rows = run_df(
+            "SELECT value FROM parquet_kv_metadata(?) WHERE key = ? LIMIT 1",
+            [uri, b"geo"],
+        )
+        if rows.empty:
+            return None
+        raw = rows.iloc[0]["value"]
+        payload = json.loads(bytes(raw).decode("utf-8"))
         primary = str(payload.get("primary_column") or "geometry")
         crs_value = (payload.get("columns") or {}).get(primary, {}).get("crs")
         return CRS.from_user_input(crs_value) if crs_value else None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except Exception:
         return None
+
+
+def _parquet_geometry_type(path: Path) -> str:
+    """Return DuckDB's physical geometry-column type without a local open."""
+    try:
+        rows = run_df(
+            "SELECT duckdb_type FROM parquet_schema(?) WHERE name = ? LIMIT 1",
+            [path_to_uri(path), "geometry"],
+        )
+        if not rows.empty:
+            return str(rows.iloc[0]["duckdb_type"] or "").strip().upper()
+    except Exception:
+        pass
+    return ""
 
 
 def _safe_bank_root(value: str | None) -> Path | None:
@@ -79,11 +105,9 @@ def _read_shape_partition(path: Path, loc_ids: list[str]) -> pd.DataFrame:
             "source_id", "source_release", "area_square_km",
         ) if column in available
     ]
-    schema = pq.read_schema(path)
-    geometry_type = schema.field("geometry").type
     if _geoparquet_crs(str(path.resolve())) is not None:
         geometry_expression = 'ST_AsWKB("geometry") AS __geometry_wkb'
-    elif pa.types.is_binary(geometry_type) or pa.types.is_large_binary(geometry_type):
+    elif _parquet_geometry_type(path) in {"BLOB", "BYTEA", "VARBINARY"}:
         geometry_expression = '"geometry" AS __geometry_wkb'
     else:
         geometry_expression = '"geometry"'
