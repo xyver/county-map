@@ -22,6 +22,7 @@ admin_0_loc_id, admin_1_loc_id, admin_2_loc_id, admin_3_loc_id,
 admin_4_loc_id, admin_5_loc_id, admin_6_loc_id,
 bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat
 """
+META_COLUMN_NAMES = [part.strip() for part in META_COLUMNS.replace("\n", " ").split(",")]
 ROUTE_INDEX_NAME = "loc_id_routes.parquet"
 
 
@@ -146,6 +147,26 @@ def _metadata_with_geometry(connection, path: Path, lon: float, lat: float,
     """, parameters).fetchall()
 
 
+def _identity_rows(connection, path: Path, loc_ids: list[str]) -> list[dict[str, Any]]:
+    """Read known identity rows without applying a spatial predicate.
+
+    Explicit virtual ``NULL<n>`` ancestors have no bounding box or geometry,
+    so they cannot participate in point containment.  Once a shaped
+    descendant has identified one through its ancestry columns, this exact
+    lookup recovers its stored metadata from the admitted layout bank.
+    """
+    requested = list(dict.fromkeys(str(value).strip() for value in loc_ids if str(value).strip()))
+    if not requested:
+        return []
+    placeholders = ",".join("?" for _ in requested)
+    rows = connection.execute(
+        f"SELECT {META_COLUMNS} FROM read_parquet(?) "
+        f"WHERE loc_id IN ({placeholders})",
+        [path_to_uri(path), *requested],
+    ).fetchall()
+    return [_row_dict(row) for row in rows]
+
+
 def _exact_candidate_rows(rows: list[tuple], lon: float, lat: float) -> list[tuple[tuple, bytes, float]]:
     """Apply the exact point-in-polygon check to shape-bearing candidates."""
     point = Point(lon, lat)
@@ -184,8 +205,7 @@ def _exact_rows(connection, path: Path, rows: list[tuple],
 
 
 def _row_dict(row: tuple) -> dict[str, Any]:
-    names = [part.strip() for part in META_COLUMNS.replace("\n", " ").split(",")]
-    return dict(zip(names, row))
+    return dict(zip(META_COLUMN_NAMES, row))
 
 
 def resolve_point(
@@ -220,9 +240,9 @@ def resolve_point(
         deep: list[tuple[tuple, bytes, float]] = []
         deep_path = root / "deep" / f"{admin1}.parquet"
         needs_deep = target_admin_level is None or int(target_admin_level) > 3
-        if needs_deep and admin3 and (is_cloud_mode() or deep_path.is_file()):
+        if needs_deep and admin1 and (is_cloud_mode() or deep_path.is_file()):
             deep_candidates = _metadata_with_geometry(
-                connection, deep_path, lon, lat, admin3,
+                connection, deep_path, lon, lat, admin3 if admin3 else "",
             )
             deep = _exact_candidate_rows(deep_candidates, lon, lat)
             deep.sort(key=lambda item: (int(item[0][2]), -item[2], str(item[0][0])))
@@ -231,10 +251,42 @@ def resolve_point(
         for item in all_matches:
             by_level[int(item[0][2])] = item
         ordered = [by_level[level] for level in sorted(by_level)]
+        deepest_metadata = _row_dict(ordered[-1][0])
+        missing_identity_ids = []
+        for level in range(int(deepest_metadata.get("admin_level", 0)) + 1):
+            loc_id = str(deepest_metadata.get(f"admin_{level}_loc_id") or "").strip()
+            if not loc_id:
+                continue
+            if not any(str(item[0][0] or "").strip() == loc_id for item in ordered):
+                missing_identity_ids.append(loc_id)
+        if missing_identity_ids:
+            identities_by_id: dict[str, dict[str, Any]] = {}
+            for row in _identity_rows(connection, root / "admin_0_3.parquet", missing_identity_ids):
+                identities_by_id[str(row.get("loc_id") or "").strip()] = row
+            if admin1 and (is_cloud_mode() or deep_path.is_file()):
+                remaining = [loc_id for loc_id in missing_identity_ids if loc_id not in identities_by_id]
+                for row in _identity_rows(connection, deep_path, remaining):
+                    identities_by_id[str(row.get("loc_id") or "").strip()] = row
+            for loc_id in missing_identity_ids:
+                row = identities_by_id.get(loc_id)
+                if row is None:
+                    raise ValueError(
+                        f"admitted admin spine ancestry {loc_id!r} is absent from "
+                        f"the {iso3} query-layout banks"
+                    )
+                row["identity_only"] = True
+                ordered.append((tuple(row.get(name) for name in META_COLUMN_NAMES), None, 0.0))
+            ordered.sort(key=lambda item: int(item[0][2]))
         final = ordered[-1]
+        identity_ids = {
+            loc_id for loc_id in missing_identity_ids if "-NULL" in loc_id
+        }
         return {
             "country": iso3,
-            "stack": [_row_dict(item[0]) for item in ordered],
+            "stack": [
+                dict(_row_dict(item[0]), **({"identity_only": True} if str(item[0][0] or "").strip() in identity_ids else {}))
+                for item in ordered
+            ],
             "matched": _row_dict(final[0]),
             "geometry_wkb": final[1],
             "shallow_candidate_count": len(shallow_candidates),

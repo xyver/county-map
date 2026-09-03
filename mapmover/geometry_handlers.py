@@ -1391,12 +1391,8 @@ def resolve_point_to_location(lon: float, lat: float, include_geometry: bool = T
     if query_layout_match is not None:
         matched = query_layout_match["matched"]
         stack = [
-            {
-                "loc_id": row.get("loc_id"),
-                "name": row.get("name"),
-                "admin_level": int(row.get("admin_level", 0)),
-            }
-            for row in query_layout_match["stack"]
+            _compact_point_stack_entry(row)
+            for row in (query_layout_match.get("stack") or [])
         ]
         result = {
             "point": {"lon": lon, "lat": lat},
@@ -1518,6 +1514,8 @@ def _compact_point_stack_entry(row) -> dict:
     )
     if vintage is not None:
         entry["vintage"] = vintage
+    if row.get("identity_only"):
+        entry["identity_only"] = True
     return entry
 
 

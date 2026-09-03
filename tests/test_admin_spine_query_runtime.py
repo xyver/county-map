@@ -257,3 +257,83 @@ def test_point_resolve_reads_each_layout_file_once_with_exact_shape_check() -> N
     assert len(connection.calls) == 2
     assert all("ST_AsWKB(geometry)" in sql for sql, _ in connection.calls)
     assert all("WHERE loc_id IN" not in sql for sql, _ in connection.calls)
+
+
+def test_point_resolve_exactly_recovers_null_ancestry_rows_from_layout_banks() -> None:
+    names = admin_spine_query.META_COLUMN_NAMES
+    square_wkb = Polygon([(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)]).wkb
+
+    ancestry = {
+        0: "DEU", 1: "DEU-AA", 2: "DEU-AA-NULL2",
+        3: "DEU-AA-NULL2-003", 4: "DEU-AA-NULL2-003-NULL4",
+        5: "DEU-AA-NULL2-003-NULL4-001",
+    }
+
+    def row(loc_id: str, level: int, *, shape: bool, name: str | None = None) -> tuple:
+        values = {column: None for column in names}
+        values.update({
+            "loc_id": loc_id,
+            "parent_id": ancestry.get(level - 1, "") if level else "",
+            "admin_level": level,
+            "name": name or loc_id,
+            **{f"admin_{item}_loc_id": value for item, value in ancestry.items()},
+            "bbox_min_lon": 0.0 if shape else None,
+            "bbox_min_lat": 0.0 if shape else None,
+            "bbox_max_lon": 10.0 if shape else None,
+            "bbox_max_lat": 10.0 if shape else None,
+        })
+        return tuple(values[column] for column in names) + (square_wkb if shape else None,)
+
+    shallow_rows = [row("DEU", 0, shape=True), row("DEU-AA", 1, shape=True)]
+    deep_rows = [
+        row(ancestry[3], 3, shape=True),
+        row(ancestry[5], 5, shape=True),
+    ]
+    null2 = row(ancestry[2], 2, shape=False, name="Missing Admin 2")
+    null4 = row(ancestry[4], 4, shape=False, name="Missing Admin 4")
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, parameters):
+            path = str(parameters[0])
+            self.calls.append((sql, parameters))
+            if "ST_AsWKB" in sql:
+                return Result(deep_rows if "/deep/" in path else shallow_rows)
+            if "/deep/" in path:
+                return Result([null4])
+            return Result([null2])
+
+        def close(self):
+            pass
+
+    connection = Connection()
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "is_cloud_mode", return_value=True),
+        patch.object(admin_spine_query, "path_to_uri", side_effect=lambda path: path.as_posix()),
+        patch.object(admin_spine_query, "_connection", return_value=connection),
+    ):
+        result = admin_spine_query.resolve_point("DEU", 5.0, 5.0, target_admin_level=5)
+
+    assert [item["loc_id"] for item in result["stack"]] == [
+        ancestry[level] for level in range(6)
+    ]
+    assert result["stack"][2]["name"] == "Missing Admin 2"
+    assert result["stack"][2]["identity_only"] is True
+    assert result["stack"][4]["name"] == "Missing Admin 4"
+    assert result["stack"][4]["identity_only"] is True
+    assert result["matched"]["loc_id"] == ancestry[5]
+    # Two spatial scans plus two exact identity lookups; NULL rows never go
+    # through the WKB/point-containment query.
+    assert len(connection.calls) == 4
+    assert sum("ST_AsWKB" in sql for sql, _ in connection.calls) == 2
