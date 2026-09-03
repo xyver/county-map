@@ -301,7 +301,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         self.assertEqual(metadata[0]["loc_id"], loc_id)
         self.assertTrue(metadata[0]["has_polygon"])
-        query_mock.assert_not_called()
+        query_mock.assert_called_once()
         graph_mock.assert_called_once()
 
     def test_admin_loc_id_info_uses_query_layout_before_reference_graph(self):

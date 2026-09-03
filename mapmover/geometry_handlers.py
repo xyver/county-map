@@ -3544,29 +3544,35 @@ def get_selection_geometries(loc_ids: list):
 
     features = []
     requested_ids = [str(loc_id).strip() for loc_id in loc_ids if str(loc_id).strip()]
-    graph_shape_ids = _reference_graph_shape_owned_ids(requested_ids)
 
     # The query layout owns both directions of the point -> loc_id -> shape
-    # contract. Fetch these rows before graph/legacy routing so get_geometry
-    # can always serve an admin loc_id returned by resolve_point.
+    # contract. Fetch these rows before graph discovery so get_geometry can
+    # always serve an admin loc_id returned by resolve_point without opening
+    # the (potentially large) reference graph first.
     query_layout_ids: set[str] = set()
     by_iso3: dict[str, list[str]] = {}
     for loc_id in requested_ids:
-        if loc_id in graph_shape_ids:
-            continue
         if not str(classify_loc_id_family(loc_id) or "").startswith("admin"):
             continue
         by_iso3.setdefault(loc_id.split("-", 1)[0].upper(), []).append(loc_id)
     for iso3, country_ids in by_iso3.items():
         query_rows = load_admin_spine_query_rows(iso3, country_ids)
-        if query_rows is None or query_rows.empty:
-            continue
-        query_layout_ids.update(query_rows["loc_id"].astype(str))
-        query_geojson = df_to_geojson(query_rows, polygon_only=True)
-        features.extend(query_geojson.get("features", []))
+        if query_rows is not None and not query_rows.empty:
+            query_layout_ids.update(query_rows["loc_id"].astype(str))
+            query_geojson = df_to_geojson(query_rows, polygon_only=True)
+            features.extend(query_geojson.get("features", []))
+        if admin_spine_layout_available(iso3):
+            # The admitted layout is authoritative for admin IDs, including
+            # exact misses. Probe only the misses for an explicit graph-owned
+            # sidechain; otherwise do not guess a deep partition from hyphens.
+            unresolved = [loc_id for loc_id in country_ids if loc_id not in query_layout_ids]
+            graph_shape_ids = _reference_graph_shape_owned_ids(unresolved) if unresolved else set()
+            query_layout_ids.update(set(country_ids) - graph_shape_ids)
 
-    # Graph-owned semantic-family partitions are authoritative regardless of
-    # loc_id prefix depth. Resolve them before legacy admin-depth routing.
+    # Graph-owned semantic-family partitions are authoritative for IDs the
+    # admin query layout did not claim. This preserves sidechain IDs whose
+    # punctuation resembles an administrative path while keeping the normal
+    # admitted-admin path bounded by the route index.
     graph_requests = [loc_id for loc_id in requested_ids if loc_id not in query_layout_ids]
     reference_df = load_reference_graph_geometry(graph_requests) if graph_requests else pd.DataFrame()
     reference_ids: set[str] = set()
@@ -3724,7 +3730,11 @@ def _reference_graph_shape_owned_ids(loc_ids: list[str]) -> set[str]:
         return {
             str(row.get("loc_id"))
             for row in identities(requested)
-            if row.get("has_shape") is True and str(row.get("geometry_bank") or "").strip()
+            if row.get("has_shape") is True
+            and str(row.get("geometry_bank") or "").strip()
+            and not str(
+                row.get("geography_family") or row.get("family") or ""
+            ).strip().lower().startswith("admin")
         }
     except Exception:
         # Graph discovery is an optional fast semantic discriminator here. The
@@ -3747,8 +3757,6 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
     rows: list[dict] = []
     requested_ids = [str(loc_id).strip() for loc_id in loc_ids if str(loc_id).strip()]
     requested_set = set(requested_ids)
-    graph_shape_ids = _reference_graph_shape_owned_ids(requested_ids)
-
     # Query-layout admin IDs should use the same bounded country/Admin1 shard
     # path as polygon retrieval. This avoids a broad reference-graph or legacy
     # bank search merely to answer has-shape and bbox questions.
@@ -3761,26 +3769,23 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
     ]
     by_iso3: dict[str, list[str]] = {}
     for loc_id in requested_ids:
-        if loc_id in graph_shape_ids:
-            continue
         if not str(classify_loc_id_family(loc_id) or "").startswith("admin"):
             continue
         by_iso3.setdefault(loc_id.split("-", 1)[0].upper(), []).append(loc_id)
     for iso3, country_ids in by_iso3.items():
-        # An admitted query layout is authoritative for current admin-family
-        # geometry in that country. Claim both hits and misses so a deliberately
-        # absent loc_id used by check/preflight calls does not fall through to a
-        # broad reference-graph geometry scan over object storage.
-        if admin_spine_layout_available(iso3):
-            query_layout_ids.update(country_ids)
         query_rows = load_admin_spine_query_rows(iso3, country_ids, columns=query_metadata_columns)
-        if query_rows is None or query_rows.empty:
-            continue
-        query_layout_ids.update(query_rows["loc_id"].astype(str))
-        for _, query_row in query_rows.iterrows():
-            item = _geometry_metadata_row(query_row)
-            if item.get("loc_id"):
-                rows.append(item)
+        if query_rows is not None and not query_rows.empty:
+            query_layout_ids.update(query_rows["loc_id"].astype(str))
+            for _, query_row in query_rows.iterrows():
+                item = _geometry_metadata_row(query_row)
+                if item.get("loc_id"):
+                    rows.append(item)
+        if admin_spine_layout_available(iso3):
+            # Keep an explicit graph-owned sidechain eligible while treating
+            # every other route miss as an authoritative admin miss.
+            unresolved = [loc_id for loc_id in country_ids if loc_id not in query_layout_ids]
+            graph_shape_ids = _reference_graph_shape_owned_ids(unresolved) if unresolved else set()
+            query_layout_ids.update(set(country_ids) - graph_shape_ids)
 
     graph_requests = [loc_id for loc_id in requested_ids if loc_id not in query_layout_ids]
     reference_df = (

@@ -313,7 +313,7 @@ class GeometrySelectionRuntimeTests(unittest.TestCase):
         with patch(
             "mapmover.geometry_handlers._reference_graph_shape_owned_ids",
             return_value={loc_id},
-        ), patch(
+        ) as ownership_mock, patch(
             "mapmover.geometry_handlers.load_admin_spine_query_rows",
         ) as query_mock, patch(
             "mapmover.geometry_handlers.load_reference_graph_geometry",
@@ -322,8 +322,61 @@ class GeometrySelectionRuntimeTests(unittest.TestCase):
             payload = get_selection_geometries([loc_id])
 
         self.assertEqual(payload["features"][0]["properties"]["loc_id"], loc_id)
-        query_mock.assert_not_called()
+        query_mock.assert_called_once_with("AUS", [loc_id])
+        ownership_mock.assert_called_once_with([loc_id])
         graph_mock.assert_called_once_with([loc_id])
+
+    def test_admitted_deep_admin_id_uses_query_layout_before_reference_graph(self):
+        loc_id = "USA-CA-037-207400-1-024"
+        query_df = pd.DataFrame([{
+            "loc_id": loc_id,
+            "parent_id": "USA-CA-037-207400-1",
+            "admin_level": 5,
+            "name": "Block 1024",
+            "geometry": '{"type":"Polygon","coordinates":[]}',
+        }])
+        query_payload = {
+            "type": "FeatureCollection",
+            "features": [{"type": "Feature", "properties": {"loc_id": loc_id}, "geometry": None}],
+        }
+        events = []
+
+        def query_rows(*args, **kwargs):
+            events.append("query")
+            return query_df
+
+        def graph_rows(*args, **kwargs):
+            events.append("graph")
+            return pd.DataFrame()
+
+        with (
+            patch("mapmover.geometry_handlers.load_admin_spine_query_rows", side_effect=query_rows),
+            patch("mapmover.geometry_handlers.df_to_geojson", return_value=query_payload),
+            patch("mapmover.geometry_handlers.load_reference_graph_geometry", side_effect=graph_rows),
+        ):
+            payload = get_selection_geometries([loc_id])
+
+        self.assertEqual(payload["features"][0]["properties"]["loc_id"], loc_id)
+        self.assertEqual(events, ["query"])
+
+    def test_authoritative_admin_route_miss_does_not_guess_deep_partition(self):
+        loc_id = "USA-CA-037-207400-1-999"
+        with (
+            patch("mapmover.geometry_handlers.admin_spine_layout_available", return_value=True),
+            patch("mapmover.geometry_handlers.load_admin_spine_query_rows", return_value=pd.DataFrame()),
+            patch("mapmover.geometry_handlers._reference_graph_shape_owned_ids", return_value=set()),
+            patch(
+                "mapmover.geometry_handlers.load_reference_graph_geometry",
+                side_effect=AssertionError("authoritative admin miss must not open graph"),
+            ),
+            patch(
+                "mapmover.geometry_handlers._load_subcounty_rows_by_loc_ids",
+                side_effect=AssertionError("authoritative admin miss must not guess a deep bank"),
+            ),
+        ):
+            payload = get_selection_geometries([loc_id])
+
+        self.assertEqual(payload["features"], [])
 
     def test_load_geometry_rows_by_loc_ids_falls_back_to_level_loader_for_usa_admin1(self):
         level_df = pd.DataFrame(
