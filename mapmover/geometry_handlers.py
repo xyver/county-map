@@ -130,6 +130,9 @@ GEOMETRY_METADATA_COLUMNS.extend([
     "bank_id",
     "release_id",
     "geography_release_id",
+    "lifecycle_status",
+    "superseded_by",
+    "successor_loc_id",
 ])
 
 
@@ -2272,6 +2275,8 @@ def _append_location_version_metadata(result: dict, row) -> dict:
         "geometry_source": ("geometry_source",),
         "bank_id": ("bank_id",),
         "release_id": ("geography_release_id", "release_id"),
+        "lifecycle_status": ("lifecycle_status",),
+        "superseded_by": ("superseded_by", "successor_loc_id"),
     }
     for output_key, input_keys in field_aliases.items():
         value = _geometry_metadata_value(row, *input_keys)

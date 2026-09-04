@@ -190,7 +190,7 @@ def build_tool_definitions() -> list[dict]:
         {
             "name": "loc_id_info",
             "title": "Get loc_id / Chain Details",
-            "description": "The drill-down tool for loc_ids returned by resolve_point and other geography calls. Pass one loc_id, or pass the point result's stack loc_ids together, to retrieve metadata, strict stored parentage, shape status, vintage/lifecycle fields, and child counts. Set include_hierarchy for the strict same-release ancestor chain and include_references for external or side-chain crosswalks. This is where detailed chain explanation belongs; resolve_point intentionally stays compact. For exact polygons use get_geometry, and for overlap or successor analysis use compare_geographies. No payment required.",
+            "description": "The drill-down tool for loc_ids returned by resolve_point and other geography calls. Pass one loc_id, or pass the point result's stack loc_ids together, to retrieve metadata, strict stored parentage, shape status, vintage/lifecycle fields, and child counts. Historical records are returned as requested; when an evidenced successor exists, supersession separately asks whether the caller wants it and never substitutes or fetches it automatically. Set include_hierarchy for the strict same-release ancestor chain and include_references for external or side-chain crosswalks. This is where detailed chain explanation belongs; resolve_point intentionally stays compact. For exact polygons use get_geometry, and for overlap or successor analysis use compare_geographies. No payment required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -301,7 +301,7 @@ def build_tool_definitions() -> list[dict]:
         {
             "name": "resolve_reference",
             "title": "Resolve Reference to loc_id",
-            "description": "Free geography utility. Converts one value, or a bounded list of values, from an external or adjacent geographic reference system into the DaedalMap loc_id universe. Examples: from_system='zip' value='00601'; from_system='nws_fire' value='AKZ317'; from_system='admin_boundary' value='Fairfax County'. Returns ranked loc_id matches with bridge vintage, overlap weights, and provenance where applicable. No payment required.",
+            "description": "Free geography utility. Converts one value, or a bounded list of values, from an external or adjacent geographic reference system into the DaedalMap loc_id universe. Examples: from_system='zip' value='00601'; from_system='nws_fire' value='AKZ317'; from_system='admin_boundary' value='Fairfax County'. Returns ranked loc_id matches with bridge vintage, overlap weights, and provenance where applicable. Historical references are returned as requested; an evidenced successor is a separate optional question and is never substituted automatically. No payment required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -401,7 +401,7 @@ def build_tool_definitions() -> list[dict]:
         {
             "name": "check_geometry",
             "title": "Check loc_id Geometry Availability",
-            "description": "Fast shape-only preflight for one loc_id or a bounded loc_id list. Reports whether each exact identity has reusable geometry and its geometry vintage; it does not resolve points or explain identity relationships. Use before get_geometry or an export. No payment required.",
+            "description": "Fast shape-only preflight for one loc_id or a bounded loc_id list. Reports whether each exact identity has reusable geometry and its geometry vintage. Historical geometry remains the primary result; an evidenced current successor is only an explicit follow-up choice. It does not resolve points or explain other identity relationships. Use before get_geometry or an export. No payment required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -469,7 +469,7 @@ def build_tool_definitions() -> list[dict]:
         {
             "name": "get_geometry",
             "title": "Get loc_id Geometry",
-            "description": "Shape retrieval for exact loc_ids, including loc_ids from any level of a resolve_point chain. Returns geometry metadata, vintage, centroid, bounding box, and optional GeoJSON polygon. It does not explain hierarchy or crosswalks; use loc_id_info for those details. Prefer bbox/centroid unless exact rendering or clipping requires the polygon. No payment required.",
+            "description": "Shape retrieval for exact loc_ids, including loc_ids from any level of a resolve_point chain. Returns the requested geometry metadata, vintage, centroid, bounding box, and optional GeoJSON polygon. Historical geometry is returned first; an evidenced successor appears only as a separate question and is never substituted or fetched automatically. It does not explain hierarchy or crosswalks; use loc_id_info for those details. Prefer bbox/centroid unless exact rendering or clipping requires the polygon. No payment required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

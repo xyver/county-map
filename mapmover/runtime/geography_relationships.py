@@ -206,6 +206,23 @@ def resolve_historical_country_reference(value: str, *, as_of: str | date | None
         "valid_at_requested_time": info.get("valid_at_requested_time") if info else None,
         "lifecycle": info,
     }
+    successor_ids = [
+        str(item.get("loc_id") or "").strip().upper()
+        for item in (info or {}).get("direct_successors") or []
+        if str(item.get("loc_id") or "").strip()
+    ]
+    if successor_ids:
+        successor_text = successor_ids[0] if len(successor_ids) == 1 else ", ".join(successor_ids)
+        result["supersession"] = {
+            "status": "superseded",
+            "requested_loc_id": selected,
+            "successor_loc_ids": successor_ids,
+            "successor_included": False,
+            "requires_explicit_selection": True,
+            "prompt": f"This has been superseded by {successor_text}. Would you like that instead?",
+        }
+        if len(successor_ids) == 1:
+            result["supersession"]["successor_loc_id"] = successor_ids[0]
     if text in yugoslavia_aliases and text not in {"HIST-YUG-SFRY", "HIST-YUG-FRY"}:
         assertions = []
         for referent_id in ("HIST-YUG-SFRY", "HIST-YUG-FRY"):

@@ -385,6 +385,90 @@ def _clean_json(value: Any) -> Any:
     return str(value)
 
 
+def geometry_supersession_notice(
+    loc_id: str,
+    record: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Describe an evidenced successor without substituting or fetching it."""
+    item = record if isinstance(record, dict) else {}
+    requested = canonicalize_loc_id(loc_id)
+    raw_targets: list[Any] = []
+    for key in ("superseded_by", "successor_loc_id", "successor_loc_ids"):
+        value = item.get(key)
+        if isinstance(value, (list, tuple, set)):
+            raw_targets.extend(value)
+        elif value not in (None, ""):
+            raw_targets.append(value)
+
+    lifecycle = str(item.get("lifecycle_status") or item.get("status") or "").strip().lower()
+    valid_to = item.get("valid_to") or item.get("valid_to_date")
+    relationship_evidence: list[str] = []
+    if not raw_targets and (valid_to not in (None, "") or lifecycle in {
+        "historical", "retired", "superseded",
+    }):
+        try:
+            from .reference_graph import relationships_for_loc_id
+
+            for edge in relationships_for_loc_id(requested, direction="both", limit=100):
+                relationship_type = str(
+                    edge.get("relationship_type") or edge.get("semantic_type") or ""
+                ).strip().lower().replace("-", "_").replace(" ", "_")
+                source = canonicalize_loc_id(str(edge.get("source_loc_id") or ""))
+                target = canonicalize_loc_id(str(edge.get("target_loc_id") or ""))
+                successor = None
+                if source == requested and relationship_type in {
+                    "superseded_by", "replaced_by", "successor", "became",
+                }:
+                    successor = target
+                elif target == requested and relationship_type in {
+                    "supersedes", "replaces", "successor_of",
+                }:
+                    successor = source
+                if successor:
+                    raw_targets.append(successor)
+                    evidence_id = str(edge.get("relationship_id") or "").strip()
+                    if evidence_id:
+                        relationship_evidence.append(evidence_id)
+        except Exception:
+            # Historical data remains usable even if optional relationship
+            # discovery is unavailable. Never turn a successor hint into a
+            # requirement for serving the requested record.
+            pass
+
+    targets = sorted({
+        canonicalize_loc_id(str(value))
+        for value in raw_targets
+        if str(value or "").strip() and canonicalize_loc_id(str(value)) != requested
+    })
+    if not targets:
+        return None
+    successor_text = targets[0] if len(targets) == 1 else ", ".join(targets)
+    notice: dict[str, Any] = {
+        "status": "superseded",
+        "requested_loc_id": requested,
+        "successor_loc_ids": targets,
+        "successor_included": False,
+        "requires_explicit_selection": True,
+        "prompt": f"This has been superseded by {successor_text}. Would you like that instead?",
+    }
+    if len(targets) == 1:
+        notice["successor_loc_id"] = targets[0]
+    if relationship_evidence:
+        notice["relationship_evidence"] = sorted(set(relationship_evidence))
+    return notice
+
+
+def _attach_geometry_supersession(
+    result: dict[str, Any],
+    requested_loc_id: str,
+    record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    notice = geometry_supersession_notice(requested_loc_id, record or result)
+    if notice:
+        return {**result, "supersession": notice}
+    return result
+
+
 def _first_populated(mapping: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         value = mapping.get(key)
@@ -1960,7 +2044,9 @@ def get_geometry_references(
                 results.append(_public_alias_error(resolution, shape=True))
                 continue
             canonical = str(resolution.get("loc_id"))
-            result = _metadata_geometry_reference(canonical, by_loc_id.get(canonical), include_info=include_info)
+            row = by_loc_id.get(canonical)
+            result = _metadata_geometry_reference(canonical, row, include_info=include_info)
+            result = _attach_geometry_supersession(result, canonical, row)
             results.append(_attach_public_alias_resolution(result, resolution))
         available = sum(1 for result in results if result.get("has_shape"))
         return _clean_json(
@@ -1987,7 +2073,10 @@ def get_geometry_references(
             results.append(_public_alias_error(resolution, shape=True))
             continue
         canonical = str(resolution.get("loc_id"))
-        result = _shape_geometry_reference(canonical, by_loc_id.get(canonical), include_polygon=include_polygon, include_info=include_info)
+        feature = by_loc_id.get(canonical)
+        result = _shape_geometry_reference(canonical, feature, include_polygon=include_polygon, include_info=include_info)
+        props = (feature or {}).get("properties") if isinstance(feature, dict) else None
+        result = _attach_geometry_supersession(result, canonical, props)
         results.append(_attach_public_alias_resolution(result, resolution))
     available = sum(1 for result in results if result.get("has_shape"))
     return _clean_json(
@@ -2035,6 +2124,7 @@ def get_geometry_availability(loc_ids: list[str]) -> dict[str, Any]:
         }
         if not item["has_shape"]:
             item["error"] = "no geometry found"
+        item = _attach_geometry_supersession(item, loc_id, result)
         items.append(_attach_public_alias_resolution(item, resolution))
     available = sum(1 for item in items if item.get("has_shape"))
     return _clean_json(

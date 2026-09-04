@@ -68,7 +68,7 @@ TOOL_GUIDANCE: dict[str, dict[str, Any]] = {
         ["You already have loc_id values and need identity, hierarchy, lifecycle, or attached references."],
         ["Returning full polygons", "Calculating pairwise overlap"],
         {"loc_id": "CAN-BC", "include_hierarchy": True},
-        ["loc_id", "parent_id", "hierarchy", "valid_from", "valid_to", "references"],
+        ["loc_id", "parent_id", "hierarchy", "valid_from", "valid_to", "supersession", "references"],
         ["check_geometry", "get_geometry", "compare_geographies"],
         ["source_system", "source_vintage", "release_id", "bank_id"]
     ),
@@ -122,7 +122,7 @@ TOOL_GUIDANCE: dict[str, dict[str, Any]] = {
         ["You have loc_ids and want a cheap exact-shape availability preflight."],
         ["Returning polygons", "Resolving identities or coordinates"],
         {"loc_ids": ["CAN-BC", "CAN-NOPE"]},
-        ["requested", "available", "missing", "items"],
+        ["requested", "available", "missing", "items", "supersession"],
         ["get_geometry", "estimate_geometry_package"],
         ["bank_id", "geometry_vintage", "source", "license"]
     ),
@@ -130,7 +130,7 @@ TOOL_GUIDANCE: dict[str, dict[str, Any]] = {
         ["You have exact loc_ids and need bbox, centroid, or opt-in polygons."],
         ["Explaining hierarchy", "Resolving names", "Bulk export packaging"],
         {"loc_id": "CAN-BC", "include_polygon": False},
-        ["loc_id", "has_shape", "bbox", "centroid", "geometry"],
+        ["loc_id", "has_shape", "bbox", "centroid", "geometry", "supersession"],
         ["loc_id_info", "estimate_geometry_package"],
         ["bank_id", "geometry_vintage", "source", "license", "release_id"]
     ),

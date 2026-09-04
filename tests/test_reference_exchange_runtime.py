@@ -12,6 +12,8 @@ from mapmover.runtime.reference_exchange import (
     LOC_ID_SYSTEM,
     convert_reference,
     get_geometry_references,
+    get_geometry_availability,
+    geometry_supersession_notice,
     list_reference_systems,
     loc_id_references,
     resolve_reference,
@@ -20,6 +22,95 @@ from mapmover.runtime.reference_identification import identify_reference_system
 
 
 class ReferenceExchangeRuntimeTests(unittest.TestCase):
+    def test_supersession_notice_keeps_requested_geometry_primary(self) -> None:
+        notice = geometry_supersession_notice(
+            "USA-CT-OLD",
+            {
+                "valid_to": "2022-12-31",
+                "superseded_by": "USA-CT-NEW",
+            },
+        )
+
+        self.assertEqual(notice["requested_loc_id"], "USA-CT-OLD")
+        self.assertEqual(notice["successor_loc_id"], "USA-CT-NEW")
+        self.assertFalse(notice["successor_included"])
+        self.assertTrue(notice["requires_explicit_selection"])
+        self.assertEqual(
+            notice["prompt"],
+            "This has been superseded by USA-CT-NEW. Would you like that instead?",
+        )
+
+    def test_geometry_response_returns_historical_record_before_successor_choice(self) -> None:
+        requested = "USA-CT-OLD"
+        row = {
+            "loc_id": requested,
+            "admin_level": 2,
+            "name": "Historical Connecticut county",
+            "valid_to": "2022-12-31",
+            "superseded_by": "USA-CT-NEW",
+            "has_polygon": True,
+        }
+        with (
+            mock.patch.object(reference_exchange, "get_selection_geometry_metadata", return_value=[row]),
+            mock.patch.object(reference_exchange, "get_location_info", return_value=row),
+        ):
+            payload = get_geometry_references([requested], include_polygon=False)
+
+        result = payload["results"][0]
+        self.assertEqual(result["loc_id"], requested)
+        self.assertEqual(result["name"], "Historical Connecticut county")
+        self.assertEqual(result["supersession"]["successor_loc_id"], "USA-CT-NEW")
+        self.assertFalse(result["supersession"]["successor_included"])
+
+    def test_geometry_polygon_does_not_include_successor_shape(self) -> None:
+        requested = "USA-CT-OLD"
+        feature = {
+            "type": "Feature",
+            "properties": {
+                "loc_id": requested,
+                "admin_level": 2,
+                "name": "Historical Connecticut county",
+                "valid_to": "2022-12-31",
+                "superseded_by": "USA-CT-NEW",
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-73.0, 41.0], [-72.0, 41.0], [-73.0, 41.0]]],
+            },
+        }
+        with mock.patch.object(
+            reference_exchange, "get_selection_geometries", return_value={"features": [feature]},
+        ) as geometry_fetch:
+            payload = get_geometry_references(
+                [requested], include_polygon=True, include_info=False,
+            )
+
+        geometry_fetch.assert_called_once_with([requested])
+        result = payload["results"][0]
+        self.assertEqual(result["loc_id"], requested)
+        self.assertEqual(result["geometry"], feature["geometry"])
+        self.assertFalse(result["supersession"]["successor_included"])
+
+    def test_geometry_availability_keeps_successor_as_notice_only(self) -> None:
+        requested = "USA-CT-OLD"
+        row = {
+            "loc_id": requested,
+            "admin_level": 2,
+            "name": "Historical Connecticut county",
+            "valid_to": "2022-12-31",
+            "superseded_by": "USA-CT-NEW",
+        }
+        with mock.patch.object(
+            reference_exchange, "get_selection_geometry_metadata", return_value=[row],
+        ):
+            payload = get_geometry_availability([requested])
+
+        item = payload["items"][0]
+        self.assertEqual(item["loc_id"], requested)
+        self.assertTrue(item["has_shape"])
+        self.assertEqual(item["supersession"]["successor_loc_id"], "USA-CT-NEW")
+        self.assertFalse(item["supersession"]["successor_included"])
+
     def test_current_admin_geometry_does_not_scan_graph_for_canonicalization_or_family(self) -> None:
         metadata = [{
             "loc_id": "USA-SD-019-967600-1-023",
@@ -392,6 +483,10 @@ class ReferenceExchangeRuntimeTests(unittest.TestCase):
             {item["loc_id"] for item in in_2025["lifecycle"]["present_day_descendants"]},
             {"SRB", "MNE"},
         )
+        self.assertEqual(in_2000["resolved_loc_id"], "HIST-YUG-FRY")
+        self.assertFalse(in_2000["supersession"]["successor_included"])
+        self.assertTrue(in_2000["supersession"]["requires_explicit_selection"])
+        self.assertIn("Would you like that instead?", in_2000["supersession"]["prompt"])
 
     def test_cloud_mode_keeps_catalog_crosswalk_artifacts_without_local_file(self) -> None:
         artifact = {

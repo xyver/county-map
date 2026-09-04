@@ -739,6 +739,8 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         self.assertIn("Pass the returned stack loc_ids to loc_id_info", tools["resolve_point"]["description"])
         self.assertIn("drill-down tool", tools["loc_id_info"]["description"])
         self.assertIn("does not explain hierarchy", tools["get_geometry"]["description"])
+        self.assertIn("never substituted", tools["get_geometry"]["description"])
+        self.assertIn("explicit follow-up choice", tools["check_geometry"]["description"])
 
     def test_get_geometry_tool_trusted_token_bypasses_batch_limit(self) -> None:
         with mock.patch.dict("os.environ", {"ARTIFACT_ACCESS_TOKENS": "tok_test_bypass", "MCP_TOOL_BATCH_LIMIT_GET_GEOMETRY": "2"}):
@@ -813,6 +815,30 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         self.assertEqual(payload["release_id"], "test-release-2021")
         self.assertEqual(payload["reference_count"], 1)
         self.assertEqual(payload["references"]["references"][0]["system"], "overlay_nws_fire_weather_zone")
+
+    def test_loc_id_info_returns_requested_history_before_successor_prompt(self) -> None:
+        with mock.patch(
+            "mapmover.geometry_handlers.get_location_info",
+            return_value={
+                "loc_id": "USA-CT-OLD",
+                "name": "Historical Connecticut county",
+                "admin_level": 2,
+                "iso3": "USA",
+                "valid_to": "2022-12-31",
+                "superseded_by": "USA-CT-NEW",
+                "has_polygon": True,
+            },
+        ):
+            payload = _tool_call(
+                self.client,
+                "loc_id_info",
+                {"loc_id": "USA-CT-OLD"},
+            )
+
+        self.assertEqual(payload["loc_id"], "USA-CT-OLD")
+        self.assertEqual(payload["name"], "Historical Connecticut county")
+        self.assertEqual(payload["supersession"]["successor_loc_id"], "USA-CT-NEW")
+        self.assertFalse(payload["supersession"]["successor_included"])
 
     def test_loc_id_info_accepts_preferred_public_alias_and_returns_canonical_id(self) -> None:
         with (

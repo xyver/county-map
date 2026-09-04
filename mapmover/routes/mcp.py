@@ -2756,6 +2756,15 @@ def _loc_id_info_item(loc_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "children_by_level": _parse_children_by_level(info.get("children_by_level")),
         "descendants_count": info.get("descendants_count"),
     }
+    try:
+        from mapmover.runtime.reference_exchange import geometry_supersession_notice
+
+        supersession = geometry_supersession_notice(canonical_loc_id, info)
+        if supersession:
+            result["supersession"] = supersession
+    except Exception:
+        # Optional successor guidance must never hide requested historical data.
+        pass
     if public_resolution.get("resolved_from_public_alias"):
         result.update({
             "requested_loc_id": requested_loc_id,
