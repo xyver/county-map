@@ -59,7 +59,7 @@ class ReferenceExchangeRuntimeTests(unittest.TestCase):
         self.assertEqual(candidate["geometry_available_count"], 2)
         self.assertEqual(
             candidate["geometry_availability_basis"],
-            "catalog_bank_for_exact_system_level",
+            "exact_identity_plus_catalog_bank",
         )
         self.assertIn("usa_admin3_census_2020", candidate["geometry_bank_ids"])
 
@@ -82,6 +82,25 @@ class ReferenceExchangeRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["geometry_available_count"], 2)
         geometry_rows.assert_not_called()
         graph_candidates.assert_not_called()
+
+    def test_connecticut_release_relabel_uses_country_catalog_evidence(self) -> None:
+        payload = identify_reference_system(
+            ["09013528100", "09110528100"],
+            expected={"system": "census_geoid", "geo_level": "tract"},
+            country_scope="USA",
+            validation_scope="all_distinct_identifiers",
+        )
+
+        candidate = payload["candidates"][0]
+        self.assertEqual(candidate["geometry_available_count"], 1)
+        self.assertIsNone(payload["recommended_binding"])
+        self.assertEqual(
+            payload["country_catalog_evidence"][0]["path"],
+            "countries/USA/usa_opportunity_zones/support/ct_2022_tract_crosswalk.csv",
+        )
+        warning_codes = {item["code"] for item in payload["warnings"]}
+        self.assertIn("identifier_geometry_coverage_incomplete", warning_codes)
+        self.assertIn("known_supporting_crosswalk_not_admitted", warning_codes)
 
     def test_partial_expected_system_still_checks_reference_graph(self) -> None:
         with mock.patch(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from .external_reference_adapters import (
@@ -20,6 +21,7 @@ from .external_reference_adapters import (
     identifier_matches,
 )
 from .family_admin_crosswalk import admin_level_name
+from ..paths import DATA_ROOT
 
 
 US_CENSUS_GEOID_SYSTEM = "us_census_geoid"
@@ -157,13 +159,72 @@ def _verified_loc_ids(values: list[str]) -> set[str]:
     return verify_loc_ids(values)
 
 
+def _country_supporting_identifier_evidence(
+    identifiers: list[str], *, country_scope: str,
+) -> list[dict[str, Any]]:
+    """Find exact values in known, non-admitted country support crosswalks."""
+    if not country_scope or not identifiers:
+        return []
+    from .geometry_catalog import load_country_geometry_catalog
+
+    catalog = load_country_geometry_catalog(country_scope)
+    wanted = set(identifiers)
+    evidence: list[dict[str, Any]] = []
+    for asset in catalog.get("supporting_crosswalk_assets") or []:
+        if not isinstance(asset, dict) or int(asset.get("row_count") or 0) > 1_000_000:
+            continue
+        path = DATA_ROOT / str(asset.get("path") or "")
+        if not path.is_file() or path.suffix.lower() not in {".csv", ".parquet"}:
+            continue
+        candidate_columns = [
+            str(column) for column in asset.get("columns") or []
+            if re.search(r"(?:fips|geoid|loc_?id|code)", str(column), re.IGNORECASE)
+        ]
+        if not candidate_columns:
+            continue
+        try:
+            import pandas as pd
+
+            if path.suffix.lower() == ".csv":
+                frame = pd.read_csv(path, usecols=candidate_columns, dtype=str, keep_default_na=False)
+            else:
+                frame = pd.read_parquet(path, columns=candidate_columns).fillna("").astype(str)
+        except Exception:
+            continue
+        matching_columns = []
+        matched_values: set[str] = set()
+        for column in candidate_columns:
+            values = set(frame[column].astype(str).str.strip())
+            matches = sorted(wanted & values)
+            if matches:
+                matched_values.update(matches)
+                matching_columns.append({
+                    "column": column,
+                    "match_count": len(matches),
+                    "sample_matches": matches[:10],
+                })
+        if matching_columns:
+            evidence.append({
+                "path": str(asset.get("path") or ""),
+                "discovery_status": asset.get("discovery_status"),
+                "callable": False,
+                "match_count": len(matched_values),
+                "unmatched_count": len(wanted - matched_values),
+                "matching_columns": matching_columns,
+                "usage_note": asset.get("usage_note"),
+            })
+    return evidence
+
+
 def _catalog_bank(*, country_scope: str, admin_level: str, expected_vintage: str | None) -> dict[str, Any] | None:
-    from .geometry_catalog import load_geometry_catalog
+    from .geometry_catalog import load_country_geometry_catalog, load_geometry_catalog
 
     country = str(country_scope or "").strip().upper()
     vintage = str(expected_vintage or "").strip().lower()
+    country_catalog = load_country_geometry_catalog(country) if country else {}
+    catalog = country_catalog if country_catalog.get("geometry_banks") else load_geometry_catalog()
     matches = []
-    for bank in load_geometry_catalog().get("geometry_banks") or []:
+    for bank in catalog.get("geometry_banks") or []:
         if not isinstance(bank, dict):
             continue
         if country and str(bank.get("scope") or "").strip().upper() != country:
@@ -206,16 +267,15 @@ def _candidate(
             admin_level=level_values[0],
             expected_vintage=expected_vintage,
         )
-    # Exact Census GEOIDs already encode a maintained system and level. Once
-    # the public catalog admits the matching bank/vintage, do not scan the
-    # large hosted Admin 0-3 parquet merely to rank the identifier system. That
-    # cold R2 scan can monopolize the single hosted worker for over a minute.
-    # Exact row existence remains a conversion/get_geometry concern; this tool
-    # is identifying the system and whether its matching geometry bank exists.
+    # A level-wide bank proves that a maintained geometry system exists, not
+    # that every syntactically valid identifier exists in it. Verify exact
+    # identities before reporting geometry availability. This remains cheaper
+    # than hydrating polygons and prevents release-specific codes from being
+    # fabricated into the canonical spine.
     if use_catalog_bank_coverage and catalog_bank:
         geometry: dict[str, dict[str, Any]] = {}
-        shape_ids = set(loc_ids)
-        geometry_availability_basis = "catalog_bank_for_exact_system_level"
+        shape_ids = _verified_loc_ids(loc_ids)
+        geometry_availability_basis = "exact_identity_plus_catalog_bank"
     else:
         geometry = _geometry_rows(loc_ids)
         shape_ids = {loc_id for loc_id, row in geometry.items() if row.get("has_shape")}
@@ -552,8 +612,24 @@ def identify_reference_system(
         status = "partial_match"
 
     selected = full_matches[0] if full_matches and status == "matched" else None
+    country_catalog_evidence = _country_supporting_identifier_evidence(
+        values, country_scope=country,
+    )
+    exact_geometry_check_required = bool(
+        selected
+        and selected.get("method") == "exact_identifier_crosswalk"
+        and selected.get("catalog_bank")
+    )
+    exact_geometry_complete = bool(
+        not exact_geometry_check_required
+        or (
+            selected
+            and int(selected.get("geometry_available_count") or 0)
+            == int(selected.get("match_count") or 0)
+        )
+    )
     recommended_binding = None
-    if selected:
+    if selected and exact_geometry_complete:
         levels = selected.get("geo_levels") or []
         recommended_binding = {
             "mode": "reference",
@@ -576,6 +652,32 @@ def identify_reference_system(
     warnings: list[dict[str, Any]] = []
     guidance = None
     clarification = None
+    if selected and exact_geometry_check_required and not exact_geometry_complete:
+        missing_count = int(selected.get("match_count") or 0) - int(
+            selected.get("geometry_available_count") or 0
+        )
+        warnings.append({
+            "code": "identifier_geometry_coverage_incomplete",
+            "message": (
+                f"The identifier system matched, but {missing_count} distinct identifier(s) "
+                "lack exact identity/geometry in the selected bank. No bulk binding was issued."
+            ),
+        })
+        if country_catalog_evidence:
+            warnings.append({
+                "code": "known_supporting_crosswalk_not_admitted",
+                "message": (
+                    "The country catalog contains exact matching values in local supporting "
+                    "crosswalk evidence, but that asset is not yet an admitted callable geometry crosswalk."
+                ),
+            })
+        guidance = {
+            "action": "inspect_country_catalog_then_admit_or_select_vintage",
+            "message": (
+                "Inspect the country catalog evidence and declared source vintage before conversion."
+            ),
+            "recommended_tool": "read_geometry_catalog",
+        }
     if str(validation_scope or "sample") == "sample" and status in {"matched", "ambiguous", "partial_match"}:
         warnings.append({
             "code": "sample_validation_only",
@@ -671,6 +773,7 @@ def identify_reference_system(
         "candidates": candidates,
         "concurring_systems": concurring_systems,
         "recommended_binding": recommended_binding,
+        "country_catalog_evidence": country_catalog_evidence,
         "next_call": {
             "tool": "estimate_conversion_job",
             "arguments": {"geography_binding": recommended_binding},

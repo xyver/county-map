@@ -28,6 +28,19 @@ CATALOG_PATH = GEOMETRY_DIR / "geometry_catalog.json"
 CROSSWALK_CATALOG_PATH = GEOMETRY_DIR / "crosswalk_catalog.json"
 
 
+def _empty_country_catalog(country: str) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0.0",
+        "country_code": country,
+        "geometry_banks": [],
+        "reference_systems": [],
+        "crosswalks": [],
+        "supporting_crosswalk_assets": [],
+        "orphaned_geometry_correspondences": [],
+        "summary": {},
+    }
+
+
 def _merge_crosswalks(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("crosswalks"):
         return payload
@@ -93,8 +106,34 @@ def load_geometry_catalog() -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=64)
+def load_country_geometry_catalog(country_scope: str) -> dict[str, Any]:
+    """Load the additive detailed catalog for one maintained country."""
+    country = str(country_scope or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", country):
+        return _empty_country_catalog(country)
+    relative = f"geometry/countries/{country}/{country}_catalog.json"
+    if _is_cloud_mode():
+        try:
+            payload = read_artifact_json(relative, lane="active")
+            if isinstance(payload, dict) and str(payload.get("country_code") or "").upper() == country:
+                return payload
+        except Exception:
+            pass
+    if not force_remote_data_reads():
+        path = GEOMETRY_DIR / "countries" / country / f"{country}_catalog.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and str(payload.get("country_code") or "").upper() == country:
+                return payload
+        except (OSError, json.JSONDecodeError):
+            pass
+    return _empty_country_catalog(country)
+
+
 def clear_geometry_catalog_cache() -> None:
     load_geometry_catalog.cache_clear()
+    load_country_geometry_catalog.cache_clear()
     _named_index.cache_clear()
     _named_group_index.cache_clear()
     # Imported late: geometry_inventory reads this module's catalog loader.

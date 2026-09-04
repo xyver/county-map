@@ -25,6 +25,7 @@ from .geography_reference import (
 )
 from .geometry_catalog import (
     geometry_capability_summary,
+    load_country_geometry_catalog,
     load_geometry_catalog,
     published_geometry_catalog_records,
     public_geometry_catalog_records,
@@ -558,8 +559,19 @@ def _catalog_crosswalks(
 ) -> list[dict[str, Any]]:
     """Return canonical crosswalk records; source manifests never reach callers."""
     country = str(country_scope or "").strip().upper()
+    global_catalog = load_geometry_catalog()
+    has_profile = any(
+        isinstance(item, dict)
+        and str(item.get("country_code") or "").upper() == country
+        for item in global_catalog.get("country_profiles") or []
+    )
+    source_catalog = (
+        load_country_geometry_catalog(country) if country and has_profile else global_catalog
+    )
+    if country and not source_catalog.get("crosswalks"):
+        source_catalog = global_catalog
     records = []
-    for item in load_geometry_catalog().get("crosswalks") or []:
+    for item in source_catalog.get("crosswalks") or []:
         if not isinstance(item, dict):
             continue
         if not read_wip and (
@@ -653,8 +665,16 @@ def list_reference_systems(
     read_wip: bool = False,
 ) -> dict[str, Any]:
     """Return the currently discoverable reference systems and crosswalks."""
-    catalog = load_geometry_catalog()
     country = str(country_scope or "").strip().upper()
+    global_catalog = load_geometry_catalog()
+    has_profile = any(
+        isinstance(item, dict)
+        and str(item.get("country_code") or "").upper() == country
+        for item in global_catalog.get("country_profiles") or []
+    )
+    catalog = load_country_geometry_catalog(country) if country and has_profile else global_catalog
+    if country and not catalog.get("country_profile") and has_profile:
+        catalog = global_catalog
     systems: dict[str, dict[str, Any]] = {
         LOC_ID_SYSTEM: {
             "system": LOC_ID_SYSTEM,
@@ -1056,6 +1076,9 @@ def read_geometry_catalog(
 ) -> dict[str, Any]:
     """Return an agent-oriented published or explicitly authorized WIP view."""
     catalog = load_geometry_catalog()
+    selected_country = str(country_scope or "").strip().upper()
+    country_catalog = load_country_geometry_catalog(selected_country) if selected_country else {}
+    has_country_catalog = bool(country_catalog.get("country_profile"))
     try:
         from .reference_graph import reference_graph_families, where_is_geography_data
 
@@ -1078,6 +1101,11 @@ def read_geometry_catalog(
         "capabilities": geometry_capability_summary(catalog),
         "runtime_data_source": data_source,
         "runtime_reference_families": graph_families,
+        "country_catalog": ({
+            "path": f"geometry/countries/{selected_country}/{selected_country}_catalog.json",
+            "catalog_fingerprint": country_catalog.get("catalog_fingerprint"),
+            "summary": country_catalog.get("summary") or {},
+        } if has_country_catalog else None),
         "usage": {
             "start_here": "Use capabilities for the concise current coverage model. Use summary or a focused inventory view only when more catalog detail is needed.",
             "loc_id_rule": "Shape and data tools are keyed to DaedalMap loc_id. If an input is not a loc_id, call resolve_reference first.",
@@ -1089,7 +1117,6 @@ def read_geometry_catalog(
             ),
         },
     }
-    selected_country = str(country_scope or "").strip().upper()
     if selected_view == "capabilities" and selected_country:
         from .geometry_inventory import country_capability_record
 
@@ -1108,6 +1135,15 @@ def read_geometry_catalog(
     if selected_view == "capabilities":
         return _clean_json(base)
     if selected_view == "summary":
+        if has_country_catalog:
+            return _clean_json({
+                **base,
+                "country_scope": selected_country,
+                "country_profile": country_catalog.get("country_profile"),
+                "family_coverage": country_catalog.get("family_coverage"),
+                "reference_system_count": len(country_catalog.get("reference_systems") or []),
+                "crosswalk_count": len(country_catalog.get("crosswalks") or []),
+            })
         return _clean_json({
             **base,
             "collections": _geometry_catalog_records(catalog, "geometry_collections", read_wip=read_wip),
@@ -1124,7 +1160,8 @@ def read_geometry_catalog(
             "crosswalk_artifacts": _geometry_catalog_crosswalk_artifacts(catalog, read_wip=read_wip),
         })
     if selected_view == "crosswalks":
-        records = _geometry_catalog_records(catalog, "crosswalks", read_wip=read_wip)
+        source = country_catalog if has_country_catalog else catalog
+        records = _geometry_catalog_records(source, "crosswalks", read_wip=read_wip)
         if selected_country:
             records = [
                 item for item in records
@@ -1143,6 +1180,26 @@ def read_geometry_catalog(
     if selected_view == "named_reference_objects":
         return _clean_json({**base, "named_reference_objects": _geometry_catalog_named_reference_objects(catalog, limit=row_limit, read_wip=read_wip)})
     if selected_view == "full":
+        if has_country_catalog:
+            if read_wip:
+                return _clean_json({**base, "country_scope": selected_country, "catalog": country_catalog})
+            return _clean_json({
+                **base,
+                "country_scope": selected_country,
+                "catalog": {
+                    "schema_version": country_catalog.get("schema_version"),
+                    "country_code": selected_country,
+                    "catalog_fingerprint": country_catalog.get("catalog_fingerprint"),
+                    "country_profile": country_catalog.get("country_profile"),
+                    "family_coverage": country_catalog.get("family_coverage"),
+                    "geometry_banks": _public_catalog_records(country_catalog, "geometry_banks"),
+                    "geometry_products": _public_catalog_records(country_catalog, "geometry_products"),
+                    "release_packages": _public_catalog_records(country_catalog, "release_packages"),
+                    "reference_systems": _public_catalog_records(country_catalog, "reference_systems"),
+                    "crosswalks": _public_catalog_records(country_catalog, "crosswalks"),
+                    "summary": country_catalog.get("summary"),
+                },
+            })
         if read_wip:
             return _clean_json({**base, "catalog": catalog})
         return _clean_json({
