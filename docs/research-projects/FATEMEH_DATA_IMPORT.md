@@ -115,6 +115,24 @@ Ops mode uses live or near-live inputs when the question is operational:
 The California Research-mode precompute is the baseline. Live Ops routing and
 disruption modeling are later layers on top of the same road-access pattern.
 
+### California evacuation zones
+
+The official Cal OES statewide aggregation is a candidate input for that next
+layer. It combines participating county and Genasys evacuation-zone polygons
+with live Normal, Warning, Order, and Shelter-in-Place status and refreshes
+about every five minutes.
+
+After source-chain and redistribution review, use the durable zone identities
+and polygons as a partial-coverage `evacuation_zone` geometry family for
+Research scenarios. Use status, reason, and update time as a linked Ops feed for
+active incidents, shelter availability, road closures, and disruption-aware
+routing. Preserve the original county/Genasys source URL and never interpret
+participating counties as complete statewide coverage.
+
+The [California Open Data record](https://lab.data.ca.gov/dataset/california-evacuation-aggregation-layer)
+labels the aggregation public domain, but the contributed county/Genasys chain
+must pass the normal licence review before hosted derivation or redistribution.
+
 ## Methodology shape
 
 The reusable accessibility pattern is:
