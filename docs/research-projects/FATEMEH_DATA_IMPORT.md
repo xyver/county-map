@@ -118,9 +118,11 @@ disruption modeling are later layers on top of the same road-access pattern.
 ### California evacuation zones
 
 The official Cal OES statewide aggregation is a candidate input for that next
-layer. It combines participating county and Genasys evacuation-zone polygons
-with live Normal, Warning, Order, and Shelter-in-Place status and refreshes
-about every five minutes.
+layer. It combines participating county and Genasys current evacuation polygons
+with live status and has a documented five-minute refresh. It is an active-feed
+view, not a complete persistent-zone inventory. Cal OES separately publishes a
+58-county availability/source inventory; persistent zone polygons still require
+reviewed county/Genasys acquisition.
 
 After source-chain and redistribution review, use the durable zone identities
 and polygons as a partial-coverage `evacuation_zone` geometry family for
@@ -129,9 +131,13 @@ active incidents, shelter availability, road closures, and disruption-aware
 routing. Preserve the original county/Genasys source URL and never interpret
 participating counties as complete statewide coverage.
 
-The [California Open Data record](https://lab.data.ca.gov/dataset/california-evacuation-aggregation-layer)
+The [California/Data.gov record](https://catalog.data.gov/dataset/california-evacuation-aggregation-layer)
 labels the aggregation public domain, but the contributed county/Genasys chain
 must pass the normal licence review before hosted derivation or redistribution.
+For bounded historical analysis, a FEMA Region 9 service currently contains 90
+daily snapshots from January 7 through April 9, 2025, across eight observed
+counties. It is not complete statewide history; prospective archival would begin
+only after permission is resolved.
 
 ## Methodology shape
 
