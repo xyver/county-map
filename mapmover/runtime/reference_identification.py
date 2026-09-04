@@ -319,6 +319,11 @@ def _candidate(
             "spine_readiness": catalog_bank.get("spine_readiness"),
         } if catalog_bank else None,
         "sample_matches": sample_matches,
+        # Retained only while candidates from the same reference system are
+        # reconciled. These are removed from the public response below.
+        "_matches": {key: list(value) for key, value in matches.items()},
+        "_levels": dict(levels or {}),
+        "_shape_ids": sorted(shape_ids),
     }
 
 
@@ -543,6 +548,11 @@ def identify_reference_system(
     expected_system_fully_matched = bool(expected_system) and any(
         candidate.get("system") == expected_system
         and candidate.get("match_count") == len(values)
+        and (
+            candidate.get("method") != "exact_identifier_crosswalk"
+            or not candidate.get("catalog_bank")
+            or candidate.get("geometry_available_count") == candidate.get("match_count")
+        )
         and candidate.get("method") in {
             "exact_identifier_crosswalk",
             "typed_external_equivalence",
@@ -554,15 +564,58 @@ def identify_reference_system(
             if not expected_system or candidate["system"] == expected_system:
                 candidates.append(candidate)
 
-    # Merge duplicate systems while preferring the candidate with more exact
-    # evidence. This can occur when a graph alias and a format adapter agree.
+    # Merge duplicate systems per identifier. A format adapter can recognize
+    # every value syntactically while an admitted graph alias corrects only the
+    # release-specific values whose generated loc_ids do not exist (notably
+    # Connecticut's 2022 tract GEOIDs). Choosing one whole candidate would
+    # discard that exact alias evidence.
     by_system: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
         prior = by_system.get(candidate["system"])
-        if prior is None or (
-            candidate["match_count"], candidate["geometry_available_count"]
-        ) > (prior["match_count"], prior["geometry_available_count"]):
+        if prior is None:
             by_system[candidate["system"]] = candidate
+            continue
+        prior_matches = prior.get("_matches") or {}
+        incoming_matches = candidate.get("_matches") or {}
+        prior_shapes = set(prior.get("_shape_ids") or [])
+        incoming_shapes = set(candidate.get("_shape_ids") or [])
+        combined: dict[str, list[str]] = {}
+        for value in values:
+            old = list(prior_matches.get(value) or [])
+            new = list(incoming_matches.get(value) or [])
+            if not old:
+                combined[value] = new
+            elif not new:
+                combined[value] = old
+            elif any(loc_id in incoming_shapes for loc_id in new) and not any(
+                loc_id in prior_shapes for loc_id in old
+            ):
+                combined[value] = new
+            elif any(loc_id in prior_shapes for loc_id in old) and not any(
+                loc_id in incoming_shapes for loc_id in new
+            ):
+                combined[value] = old
+            elif _METHOD_RANK.get(str(candidate.get("method") or ""), 99) < _METHOD_RANK.get(
+                str(prior.get("method") or ""), 99
+            ):
+                combined[value] = new
+            else:
+                combined[value] = old
+        levels = {**(prior.get("_levels") or {}), **(candidate.get("_levels") or {})}
+        by_system[candidate["system"]] = _candidate(
+            system=candidate["system"],
+            identifiers=values,
+            matches=combined,
+            levels=levels,
+            method=(
+                "exact_identifier_crosswalk"
+                if candidate["system"] == US_CENSUS_GEOID_SYSTEM
+                else str(prior.get("method") or candidate.get("method") or "reference_graph_exact_alias")
+            ),
+            expected_vintage=expected_vintage,
+            country_scope=country,
+            use_catalog_bank_coverage=(candidate["system"] == US_CENSUS_GEOID_SYSTEM),
+        )
     candidates = list(by_system.values())
     candidates.sort(key=lambda item: (
         -float(item.get("match_rate") or 0),
@@ -756,6 +809,10 @@ def identify_reference_system(
             }],
         }
 
+    public_candidates = [
+        {key: value for key, value in candidate.items() if not key.startswith("_")}
+        for candidate in candidates
+    ]
     return {
         "ok": status in {"matched", "ambiguous", "partial_match"},
         "status": status,
@@ -770,7 +827,7 @@ def identify_reference_system(
             "internal_release": expected_internal_release,
             "country_scope": country or None,
         },
-        "candidates": candidates,
+        "candidates": public_candidates,
         "concurring_systems": concurring_systems,
         "recommended_binding": recommended_binding,
         "country_catalog_evidence": country_catalog_evidence,

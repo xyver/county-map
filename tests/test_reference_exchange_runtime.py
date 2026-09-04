@@ -19,6 +19,7 @@ from mapmover.runtime.reference_exchange import (
     resolve_reference,
 )
 from mapmover.runtime.reference_identification import identify_reference_system
+from mapmover.runtime.reference_graph import clear_reference_graph_cache
 
 
 class ReferenceExchangeRuntimeTests(unittest.TestCase):
@@ -174,24 +175,66 @@ class ReferenceExchangeRuntimeTests(unittest.TestCase):
         geometry_rows.assert_not_called()
         graph_candidates.assert_not_called()
 
-    def test_connecticut_release_relabel_uses_country_catalog_evidence(self) -> None:
-        payload = identify_reference_system(
-            ["09013528100", "09110528100"],
-            expected={"system": "census_geoid", "geo_level": "tract"},
-            country_scope="USA",
-            validation_scope="all_distinct_identifiers",
-        )
+    def test_connecticut_release_relabel_uses_admitted_reference_alias(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {"GEOGRAPHY_REFERENCE_GRAPH_ROOT": "geometry/countries/USA/reference_graph"},
+        ):
+            clear_reference_graph_cache()
+            payload = identify_reference_system(
+                ["09013528100", "09110528100"],
+                expected={"system": "census_geoid", "geo_level": "tract"},
+                country_scope="USA",
+                validation_scope="all_distinct_identifiers",
+            )
+        clear_reference_graph_cache()
 
         candidate = payload["candidates"][0]
-        self.assertEqual(candidate["geometry_available_count"], 1)
-        self.assertIsNone(payload["recommended_binding"])
-        self.assertEqual(
-            payload["country_catalog_evidence"][0]["path"],
-            "countries/USA/usa_opportunity_zones/support/ct_2022_tract_crosswalk.csv",
-        )
+        self.assertEqual(candidate["geometry_available_count"], 2)
+        self.assertEqual(payload["recommended_binding"]["system"], "us_census_geoid")
+        self.assertEqual(payload["recommended_binding"]["geo_level"], "admin_3")
         warning_codes = {item["code"] for item in payload["warnings"]}
-        self.assertIn("identifier_geometry_coverage_incomplete", warning_codes)
-        self.assertIn("known_supporting_crosswalk_not_admitted", warning_codes)
+        self.assertNotIn("identifier_geometry_coverage_incomplete", warning_codes)
+        self.assertNotIn("known_supporting_crosswalk_not_admitted", warning_codes)
+
+    def test_expected_census_system_checks_graph_when_syntax_match_lacks_geometry(self) -> None:
+        graph_candidate = {
+            "system": "us_census_geoid",
+            "method": "reference_graph_exact_alias",
+            "match_count": 1,
+            "unmatched_count": 0,
+            "match_rate": 1.0,
+            "ambiguous_identifier_count": 0,
+            "geo_levels": [],
+            "loc_id_resolvable": True,
+            "geometry_available": True,
+            "geometry_available_count": 1,
+            "geometry_bank_ids": [],
+            "geometry_vintages": [],
+            "expected_vintage_supported": None,
+            "catalog_bank": None,
+            "sample_matches": [{
+                "identifier": "09110528100",
+                "loc_ids": ["USA-CT-013-528100"],
+                "geo_level": None,
+                "geometry_available": True,
+            }],
+            "_matches": {"09110528100": ["USA-CT-013-528100"]},
+            "_levels": {},
+            "_shape_ids": ["USA-CT-013-528100"],
+        }
+        with mock.patch(
+            "mapmover.runtime.reference_identification._reference_graph_candidates",
+            return_value=[graph_candidate],
+        ) as graph_candidates:
+            payload = identify_reference_system(
+                ["09110528100"],
+                expected={"system": "census_geoid", "geo_level": "tract"},
+                country_scope="USA",
+            )
+
+        graph_candidates.assert_called_once()
+        self.assertEqual(payload["candidates"][0]["geometry_available_count"], 1)
 
     def test_partial_expected_system_still_checks_reference_graph(self) -> None:
         with mock.patch(
