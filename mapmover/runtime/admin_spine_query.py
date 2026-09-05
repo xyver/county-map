@@ -444,9 +444,38 @@ def load_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[str] | Non
     )
     root = layout_root(iso3)
     manifest = _layout_manifest(iso3)
-    route_index_required = bool((manifest.get("route_index") or {}).get("path") == ROUTE_INDEX_NAME)
+    route_spec = manifest.get("route_index") or {}
+    route_index_required = bool(route_spec.get("path") == ROUTE_INDEX_NAME)
     route_rows: dict[str, tuple[int, str]] = {}
     route_path = root / ROUTE_INDEX_NAME
+    route_metadata_columns = {
+        str(column) for column in (route_spec.get("metadata_columns") or []) if str(column)
+    }
+    # Metadata and availability requests should be answered by the compact,
+    # loc_id-sorted route index when the published manifest proves that it
+    # carries the requested projection. This is one remote file read and keeps
+    # 1000s of exact IDs away from 100-400 MiB polygon banks.
+    if columns is not None and set(projection).issubset(route_metadata_columns):
+        connection = _connection()
+        try:
+            placeholders = ",".join("?" for _ in requested)
+            frame = connection.execute(
+                f"SELECT {select_clause} FROM read_parquet(?) "
+                f"WHERE loc_id IN ({placeholders})",
+                [path_to_uri(route_path), *requested],
+            ).fetchdf()
+        finally:
+            connection.close()
+        if frame.empty:
+            return frame
+        order = {loc_id: index for index, loc_id in enumerate(requested)}
+        frame["_requested_order"] = frame["loc_id"].map(order)
+        return (
+            frame.sort_values("_requested_order")
+            .drop(columns=["_requested_order"])
+            .drop_duplicates(subset=["loc_id"], keep="first")
+            .reset_index(drop=True)
+        )
     if route_index_required or route_path.is_file():
         route_connection = _connection()
         try:

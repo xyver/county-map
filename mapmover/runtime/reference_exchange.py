@@ -2131,9 +2131,10 @@ def _metadata_geometry_reference(
     if not row:
         return {"ok": False, "loc_id": canonical, "has_shape": False, "error": "no geometry found"}
     family = _reference_family(canonical, admin_level=row.get("admin_level"))
+    has_shape = bool(row.get("has_polygon", True))
     payload = {
-        "ok": True,
-        "has_shape": True,
+        "ok": has_shape,
+        "has_shape": has_shape,
         "loc_id": row.get("loc_id") or row.get("source_loc_id") or canonical,
         "name": row.get("name"),
         "family": family,
@@ -2324,7 +2325,7 @@ def get_geometry_availability(loc_ids: list[str]) -> dict[str, Any]:
             continue
         loc_id = str(resolution.get("loc_id"))
         result = by_loc_id.get(loc_id)
-        has_shape = bool(result)
+        has_shape = bool(result and result.get("has_polygon", True))
         item = {
             "loc_id": loc_id,
             "has_shape": has_shape,

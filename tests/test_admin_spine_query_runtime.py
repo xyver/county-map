@@ -161,6 +161,49 @@ def test_route_index_handles_ids_whose_hyphens_do_not_encode_depth() -> None:
     assert result["loc_id"].tolist() == ["DEU-GEM-091620000000"]
 
 
+def test_metadata_projection_reads_only_enriched_route_index() -> None:
+    opened_paths = []
+
+    class Result:
+        def fetchdf(self):
+            return pd.DataFrame({
+                "loc_id": ["USA-TX-201-001-1-001"],
+                "name": ["Block 1001"],
+                "has_polygon": [True],
+            })
+
+    class Connection:
+        def execute(self, _sql, parameters=None):
+            opened_paths.append(parameters[0])
+            return Result()
+
+        def close(self):
+            pass
+
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "path_to_uri", side_effect=lambda path: path.as_posix()),
+        patch.object(admin_spine_query, "_layout_manifest", return_value={
+            "route_index": {
+                "path": "loc_id_routes.parquet",
+                "metadata_columns": ["loc_id", "name", "has_polygon"],
+            },
+        }),
+        patch.object(admin_spine_query, "_connection", return_value=Connection()),
+    ):
+        result = admin_spine_query.load_rows_by_loc_ids(
+            "USA", ["USA-TX-201-001-1-001"], columns=["name", "has_polygon"],
+        )
+
+    assert opened_paths == ["layout/loc_id_routes.parquet"]
+    assert result.to_dict("records") == [{
+        "loc_id": "USA-TX-201-001-1-001",
+        "name": "Block 1001",
+        "has_polygon": True,
+    }]
+
+
 def test_descendant_scope_routes_state_to_one_deep_bank() -> None:
     calls = []
 
