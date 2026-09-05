@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 from pathlib import Path
 from typing import Any
 
-from ..duckdb_helpers import build_guarded_connection, is_cloud_mode, parquet_columns, path_to_uri, select_rows
+from ..duckdb_helpers import is_cloud_mode, lease_query_connection, parquet_columns, path_to_uri, select_rows
 from ..paths import DATA_ROOT
 from ..runtime_config import get_runtime_config
 from .published_artifacts import read_artifact_json, relative_data_path
@@ -79,11 +79,7 @@ def _sql_path(path: Path) -> str:
 
 
 def _connection():
-    connection = build_guarded_connection()
-    if connection is None:
-        raise RuntimeError("DuckDB is required for reference-graph queries")
-    connection.execute("SET enable_progress_bar=false")
-    return connection
+    return lease_query_connection()
 
 
 def _relative_data_path(path: Path) -> str:

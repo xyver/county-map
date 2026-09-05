@@ -21,6 +21,38 @@ from mapmover.runtime.query_constraint_primitives import extract_query_constrain
 
 
 class EventQueryRuntimeTests(unittest.TestCase):
+    def test_dataset_query_empty_in_filter_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parquet_path = Path(tmp) / "rows.parquet"
+            pd.DataFrame([{"loc_id": "USA", "year": 2026}]).to_parquet(parquet_path, index=False)
+            spec = ApiSourceSpec(
+                source_id="test", pack_id="test", parquet_name="rows.parquet",
+                query_mode="single_source", location_field="loc_id",
+                time_field="year", time_granularity="yearly", metrics={},
+                filterable_fields={"loc_id", "year"}, sortable_fields={"loc_id", "year"},
+            )
+            object.__setattr__(spec, "local_parquet_path", str(parquet_path))
+            rows = execute_dataset_query(
+                spec, select_columns=["loc_id"], in_filters={"loc_id": []},
+            )
+        self.assertEqual(rows, [])
+
+    def test_dataset_query_unknown_filter_is_explicit_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parquet_path = Path(tmp) / "rows.parquet"
+            pd.DataFrame([{"loc_id": "USA"}]).to_parquet(parquet_path, index=False)
+            spec = ApiSourceSpec(
+                source_id="test", pack_id="test", parquet_name="rows.parquet",
+                query_mode="single_source_static", location_field="loc_id",
+                time_field=None, time_granularity=None, metrics={},
+                filterable_fields={"loc_id"}, sortable_fields={"loc_id"},
+            )
+            object.__setattr__(spec, "local_parquet_path", str(parquet_path))
+            with self.assertRaisesRegex(ValueError, "absent from source"):
+                execute_dataset_query(
+                    spec, select_columns=["loc_id"], exact_filters={"missing": "value"},
+                )
+
     def test_dataset_query_matches_delimited_hierarchical_region_field(self):
         with tempfile.TemporaryDirectory() as tmp:
             parquet_path = Path(tmp) / "events.parquet"

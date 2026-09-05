@@ -387,7 +387,7 @@ def tool_help_payload(
     tool_definition: dict[str, Any],
     available_on_facades: list[str],
     effective_limits: dict[str, Any] | None = None,
-    local_unrestricted: bool = False,
+    local_installed: bool = False,
 ) -> dict[str, Any]:
     name = str(tool_name or "").strip()
     guidance = deepcopy(TOOL_GUIDANCE.get(name) or {})
@@ -416,16 +416,15 @@ def tool_help_payload(
             "payment_challenge",
         ],
     }
-    if local_unrestricted:
+    if local_installed:
         access.update({
             "access_lane": "local_installed",
-            "limits": {},
-            "above_free_limit": "not_applicable",
             "rate_limited_independently": False,
-            "service_item_caps_enforced": False,
+            "service_item_caps_enforced": True,
+            "payment_required": False,
             "resource_boundary": "local machine memory, disk, and process availability",
         })
-    if name == "resolve_point" and not local_unrestricted:
+    if name == "resolve_point" and not local_installed:
         access["caller_tiers"] = {
             "anonymous": {"included_items": limits.get("free_item_limit"), "above_limit": "payment_required"},
             "verified_account": {"included_items": limits.get("paid_item_limit"), "above_limit": "paid_export_or_dashboard"},

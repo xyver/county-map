@@ -47,6 +47,7 @@ from .geography_relationships import resolve_historical_country_reference
 from .loc_id_resolution import resolve_admin_text_to_loc_id
 from .family_admin_crosswalk import (
     admin_level_name,
+    resolve_admin_ids_to_family,
     resolve_admin_to_family,
     resolve_family_to_admin,
     resolve_family_ids_to_admin,
@@ -1941,6 +1942,147 @@ def convert_reference(
     })
 
 
+def convert_references_batch(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert many references with grouped source and target crosswalk scans."""
+    results: list[dict[str, Any] | None] = [None] * len(requests)
+    source_requests: list[dict[str, Any]] = []
+    source_indexes: list[int] = []
+
+    catalog_by_country: dict[str, list[dict[str, Any]]] = {}
+    for index, request in enumerate(requests):
+        from_system = _normalize_system(request.get("from_system"))
+        target = _normalize_system(request.get("to_system"))
+        iso3 = str(request.get("iso3") or "USA").strip().upper()
+        if iso3 not in catalog_by_country:
+            catalog_by_country[iso3] = _catalog_crosswalks(country_scope=iso3)
+        records = catalog_by_country[iso3]
+        has_direct_pair = any(
+            record.get("execution_strategy") in {"direct_relationship_artifact", "measured_relationship_artifact"}
+            and (
+                (
+                    str(record.get("source_system") or "") == from_system
+                    and str(record.get("target_system") or "") == target
+                )
+                or (
+                    str(record.get("target_system") or "") == from_system
+                    and str(record.get("source_system") or "") == target
+                )
+            )
+            for record in records
+        )
+        if has_direct_pair or get_external_adapter(target):
+            results[index] = convert_reference(**request)
+            continue
+        source_indexes.append(index)
+        source_requests.append({key: value for key, value in request.items() if key != "to_system"})
+
+    resolved_sources = resolve_references_batch(source_requests)
+    reverse_groups: dict[tuple[Any, ...], list[tuple[int, dict[str, Any], dict[str, Any], str]]] = {}
+    for index, request, resolved in zip(source_indexes, (requests[i] for i in source_indexes), resolved_sources):
+        target = _normalize_system(request.get("to_system"))
+        loc_id = str(resolved.get("resolved_loc_id") or "").strip()
+        if not loc_id:
+            results[index] = _clean_json({
+                "ok": False,
+                "from": resolved,
+                "to_system": target,
+                "error": "source reference did not resolve to loc_id",
+            })
+            continue
+        if target in {LOC_ID_SYSTEM, "admin_local", "admin_geometry"}:
+            results[index] = _clean_json({
+                "ok": True,
+                "from": resolved,
+                "to_system": target,
+                "results": [{"system": target, "value": loc_id}],
+            })
+            continue
+        level = admin_level_name(request.get("target_admin_level") or "admin_2")
+        iso3 = str(request.get("iso3") or "USA").strip().upper()
+        artifact = _first_crosswalk_artifact(
+            source_family=target,
+            target_admin_level=level,
+            iso3=iso3,
+            relationship_vintage=request.get("relationship_vintage"),
+        )
+        if not artifact:
+            references = loc_id_references(
+                loc_id,
+                systems=[target],
+                iso3=iso3,
+                target_admin_level=level,
+                min_share=request.get("min_share"),
+                limit_per_system=request.get("limit"),
+                source_release=request.get("source_release"),
+                internal_release=request.get("internal_release"),
+            )
+            matches = [ref for ref in references.get("references") or [] if ref.get("system") == target]
+            results[index] = _conversion_result_from_references(resolved, target, loc_id, matches)
+            continue
+        key = (
+            target,
+            level,
+            iso3,
+            str(_catalog_crosswalk_path(artifact) or ""),
+            request.get("min_share"),
+            int(request.get("limit") or 10),
+        )
+        reverse_groups.setdefault(key, []).append((index, request, resolved, loc_id))
+
+    for (target, level, iso3, artifact_path, min_share, limit), members in reverse_groups.items():
+        loc_ids = [loc_id for _index, _request, _resolved, loc_id in members]
+        batched = resolve_admin_ids_to_family(
+            loc_ids,
+            source_family=target,
+            target_admin_level=level,
+            iso3=iso3,
+            crosswalk_path=Path(artifact_path),
+            min_target_area_share=min_share,
+            limit=limit,
+        )
+        for index, _request, resolved, loc_id in members:
+            references = []
+            for overlap in (batched.get(loc_id) or {}).get("overlaps") or []:
+                source_ref = overlap.get("source") or {}
+                references.append({
+                    "system": target,
+                    "crosswalk_source_system": target,
+                    "value": source_ref.get("loc_id"),
+                    "name": source_ref.get("name"),
+                    "role": "crosswalk_overlap",
+                    "relationship_vintage": overlap.get("relationship_vintage"),
+                    "match_share": overlap.get("match_share"),
+                    "match_rank": overlap.get("match_rank"),
+                    "is_primary": overlap.get("is_primary"),
+                })
+            results[index] = _conversion_result_from_references(resolved, target, loc_id, references)
+    return [result or {"ok": False, "error": "batch conversion produced no result"} for result in results]
+
+
+def _conversion_result_from_references(
+    resolved: dict[str, Any], target: str, loc_id: str, references: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not references:
+        return _clean_json({
+            "ok": False,
+            "from": resolved,
+            "to_system": target,
+            "results": [],
+            "loc_id": loc_id,
+            "error": {
+                "code": "unsupported_target_system",
+                "message": f"no references found from loc_id to {target}",
+            },
+        })
+    return _clean_json({
+        "ok": True,
+        "from": resolved,
+        "to_system": target,
+        "results": references,
+        "loc_id": loc_id,
+    })
+
+
 def _shape_geometry_reference(
     loc_id: str,
     feature: dict[str, Any] | None,
@@ -2026,7 +2168,12 @@ def get_geometry_references(
     # is unchanged.  Inputs that miss the exact bank still go through the graph
     # resolver, which preserves preferred-public-loc_id aliases.
     requested_ids = [canonicalize_loc_id(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
-    direct_rows = get_selection_geometry_metadata(requested_ids) if not include_polygon else []
+    direct_features: list[dict[str, Any]] = []
+    if include_polygon:
+        direct_features = (get_selection_geometries(requested_ids) or {}).get("features") or []
+        direct_rows = []
+    else:
+        direct_rows = get_selection_geometry_metadata(requested_ids)
     direct_ids = {
         canonicalize_loc_id(str(row.get("loc_id") or row.get("source_loc_id") or ""))
         for row in direct_rows
@@ -2037,6 +2184,19 @@ def get_geometry_references(
             admin_level=row.get("admin_level"),
         ) in {"admin_0", "admin_local", "admin_geometry"}
     }
+    if include_polygon:
+        direct_ids = {
+            canonicalize_loc_id(str((feature.get("properties") or {}).get("local_loc_id") or (feature.get("properties") or {}).get("loc_id") or ""))
+            for feature in direct_features
+            if (feature.get("properties") or {}).get("local_loc_id") or (feature.get("properties") or {}).get("loc_id")
+        }
+    else:
+        # An explicit sidechain bank is just as authoritative for its own IDs
+        # as an admin layout. Do not query the graph once per ZCTA/zone/etc.
+        direct_ids.update({
+            canonicalize_loc_id(str(row.get("loc_id") or row.get("source_loc_id") or ""))
+            for row in direct_rows if row.get("loc_id") or row.get("source_loc_id")
+        })
     resolutions = [
         {
             "ok": True,
@@ -2089,8 +2249,12 @@ def get_geometry_references(
             }
         )
 
-    feature_payload = get_selection_geometries(canonical_ids)
-    features = (feature_payload or {}).get("features") or []
+    missing_canonical_ids = [loc_id for loc_id in canonical_ids if canonicalize_loc_id(loc_id) not in direct_ids]
+    alias_features = (
+        (get_selection_geometries(missing_canonical_ids) or {}).get("features") or []
+        if missing_canonical_ids else []
+    )
+    features = [*direct_features, *alias_features]
     by_loc_id: dict[str, dict[str, Any]] = {}
     for feature in features:
         props = feature.get("properties") or {}
@@ -2122,9 +2286,32 @@ def get_geometry_references(
 
 def get_geometry_availability(loc_ids: list[str]) -> dict[str, Any]:
     """Return a lightweight shape-availability preflight for one or more loc_ids."""
-    resolutions = [resolve_loc_id_input(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    requested_ids = [canonicalize_loc_id(str(loc_id)) for loc_id in loc_ids if str(loc_id).strip()]
+    rows = get_selection_geometry_metadata(requested_ids)
+    direct_ids = {
+        canonicalize_loc_id(str(row.get("loc_id") or row.get("source_loc_id") or ""))
+        for row in rows if row.get("loc_id") or row.get("source_loc_id")
+    }
+    resolutions = [
+        {
+            "ok": True,
+            "status": "unchanged",
+            "requested_loc_id": requested,
+            "loc_id": requested,
+            "resolved_from_public_alias": False,
+        }
+        if requested in direct_ids else resolve_loc_id_input(requested)
+        for requested in requested_ids
+    ]
     canonical_ids = [str(item.get("loc_id")) for item in resolutions if item.get("ok") and item.get("loc_id")]
-    rows = get_selection_geometry_metadata(canonical_ids)
+    attempted_ids = set(requested_ids)
+    alias_targets = [
+        loc_id for loc_id in canonical_ids
+        if canonicalize_loc_id(loc_id) not in direct_ids
+        and canonicalize_loc_id(loc_id) not in attempted_ids
+    ]
+    if alias_targets:
+        rows = [*rows, *get_selection_geometry_metadata(alias_targets)]
     by_loc_id: dict[str, dict[str, Any]] = {}
     for row in rows:
         row_loc_id = row.get("loc_id") or row.get("source_loc_id")

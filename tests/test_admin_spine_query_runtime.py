@@ -51,7 +51,7 @@ def test_cloud_layout_availability_fails_closed_without_catalog_activation() -> 
     fallback.assert_not_called()
 
 
-def test_cloud_metadata_uses_object_store_uri() -> None:
+def test_cloud_point_candidates_use_object_store_uri() -> None:
     class Connection:
         def execute(self, _sql, parameters):
             self.parameters = parameters
@@ -62,7 +62,7 @@ def test_cloud_metadata_uses_object_store_uri() -> None:
 
     connection = Connection()
     with patch.object(admin_spine_query, "path_to_uri", return_value="s3://bucket/published/layout.parquet"):
-        admin_spine_query._metadata(connection, Path("layout.parquet"), 1.0, 2.0)
+        admin_spine_query._metadata_with_geometry(connection, Path("layout.parquet"), 1.0, 2.0)
     assert connection.parameters[0] == "s3://bucket/published/layout.parquet"
 
 
@@ -161,6 +161,90 @@ def test_route_index_handles_ids_whose_hyphens_do_not_encode_depth() -> None:
     assert result["loc_id"].tolist() == ["DEU-GEM-091620000000"]
 
 
+def test_descendant_scope_routes_state_to_one_deep_bank() -> None:
+    calls = []
+
+    class Result:
+        def __init__(self, *, row=None, frame=None):
+            self.row = row
+            self.frame = frame
+
+        def fetchone(self):
+            return self.row
+
+        def fetchdf(self):
+            return self.frame
+
+    class Connection:
+        def execute(self, sql, parameters):
+            calls.append((sql, parameters))
+            if str(parameters[0]).endswith("loc_id_routes.parquet"):
+                return Result(row=(1, "USA-TX"))
+            rows = []
+            for loc_id in ("USA-TX-201-A", "USA-TX-201-B"):
+                row = {name: None for name in admin_spine_query.META_COLUMN_NAMES}
+                row.update({
+                    "loc_id": loc_id,
+                    "parent_id": "USA-TX-201",
+                    "admin_level": 4,
+                    "name": loc_id,
+                    "admin_0_loc_id": "USA",
+                    "admin_1_loc_id": "USA-TX",
+                    "admin_2_loc_id": "USA-TX-201",
+                    "__total_count": 2,
+                })
+                rows.append(row)
+            return Result(frame=pd.DataFrame(rows))
+
+        def close(self):
+            pass
+
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "is_cloud_mode", return_value=True),
+        patch.object(admin_spine_query, "path_to_uri", side_effect=lambda path: path.as_posix()),
+        patch.object(admin_spine_query, "_connection", return_value=Connection()),
+    ):
+        result = admin_spine_query.query_descendant_scope(
+            "USA", "USA-TX", 4, limit=10,
+        )
+
+    assert result is not None
+    assert result["total_count"] == 2
+    assert [row["loc_id"] for row in result["rows"]] == ["USA-TX-201-A", "USA-TX-201-B"]
+    assert [parameters[0] for _, parameters in calls] == [
+        "layout/loc_id_routes.parquet",
+        "layout/deep/USA-TX.parquet",
+    ]
+    result_sql, result_parameters = calls[1]
+    assert '"admin_1_loc_id" = ?' in result_sql
+    assert result_parameters[:3] == ["layout/deep/USA-TX.parquet", 4, "USA-TX"]
+
+
+def test_descendant_scope_refuses_country_wide_deep_multibank_scan() -> None:
+    class Result:
+        def fetchone(self):
+            return (0, "")
+
+    class Connection:
+        def execute(self, _sql, _parameters):
+            return Result()
+
+        def close(self):
+            pass
+
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "path_to_uri", side_effect=lambda path: path.as_posix()),
+        patch.object(admin_spine_query, "_connection", return_value=Connection()),
+    ):
+        result = admin_spine_query.query_descendant_scope("USA", "USA", 4)
+
+    assert result is None
+
+
 def test_modern_layout_fails_closed_when_route_index_is_unreadable() -> None:
     class Connection:
         def execute(self, _sql, parameters=None):
@@ -245,7 +329,6 @@ def test_point_resolve_reads_each_layout_file_once_with_exact_shape_check() -> N
         patch.object(admin_spine_query, "is_cloud_mode", return_value=True),
         patch.object(admin_spine_query, "path_to_uri", side_effect=lambda path: path.as_posix()),
         patch.object(admin_spine_query, "_connection", return_value=connection),
-        patch.object(admin_spine_query, "_exact_rows", side_effect=AssertionError("duplicate shape scan")),
     ):
         result = admin_spine_query.resolve_point("USA", 5.0, 5.0, target_admin_level=5)
 
@@ -257,6 +340,58 @@ def test_point_resolve_reads_each_layout_file_once_with_exact_shape_check() -> N
     assert len(connection.calls) == 2
     assert all("ST_AsWKB(geometry)" in sql for sql, _ in connection.calls)
     assert all("WHERE loc_id IN" not in sql for sql, _ in connection.calls)
+
+
+def test_batch_point_resolve_opens_shallow_bank_once_for_every_point() -> None:
+    """Batch size must not multiply physical Parquet reads."""
+    square_wkb = Polygon([(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)]).wkb
+    rows = []
+    for level, loc_id, parent_id in (
+        (0, "USA", ""),
+        (1, "USA-CA", "USA"),
+        (2, "USA-CA-001", "USA-CA"),
+    ):
+        row = {name: "" for name in admin_spine_query.META_COLUMN_NAMES}
+        row.update({
+            "loc_id": loc_id,
+            "parent_id": parent_id,
+            "admin_level": level,
+            "name": loc_id,
+            "admin_0_loc_id": "USA",
+            "admin_1_loc_id": "USA-CA" if level >= 1 else "",
+            "admin_2_loc_id": "USA-CA-001" if level >= 2 else "",
+            "bbox_min_lon": 0.0,
+            "bbox_min_lat": 0.0,
+            "bbox_max_lon": 10.0,
+            "bbox_max_lat": 10.0,
+            "geometry": square_wkb,
+        })
+        rows.append(row)
+    frame = pd.DataFrame(rows)
+
+    class Connection:
+        def close(self):
+            pass
+
+    with (
+        patch.object(admin_spine_query, "layout_available", return_value=True),
+        patch.object(admin_spine_query, "layout_root", return_value=Path("layout")),
+        patch.object(admin_spine_query, "_connection", return_value=Connection()),
+        patch.object(
+            admin_spine_query,
+            "_metadata_with_geometry_bbox",
+            return_value=frame,
+        ) as bank_read,
+    ):
+        result = admin_spine_query.resolve_points(
+            "USA",
+            [{"lon": 5.0, "lat": 5.0} for _ in range(100)],
+            target_admin_level=2,
+        )
+
+    bank_read.assert_called_once()
+    assert len(result or []) == 100
+    assert all(item["matched"]["loc_id"] == "USA-CA-001" for item in result or [])
 
 
 def test_point_resolve_exactly_recovers_null_ancestry_rows_from_layout_banks() -> None:

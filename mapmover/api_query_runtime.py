@@ -616,18 +616,21 @@ def _extract_requested_year_bounds(time_filter: dict[str, Any] | None) -> tuple[
 
 def _compute_contiguous_timestamp_suffix_start(parquet_path: Path) -> int | None:
     try:
-        df = pd.read_parquet(parquet_path, columns=["year", "timestamp"])
+        df = run_df(
+            "SELECT year, COUNT(*) AS row_count, COUNT(timestamp) AS timestamp_count "
+            "FROM read_parquet(?) GROUP BY year",
+            [path_to_uri(parquet_path)],
+        )
     except Exception:
         return None
-    if df.empty or "year" not in df.columns or "timestamp" not in df.columns:
+    if df.empty:
         return None
-    years = pd.to_numeric(df["year"], errors="coerce")
-    timestamps = pd.to_datetime(df["timestamp"], errors="coerce")
-    coverage = pd.DataFrame({"year": years, "has_timestamp": timestamps.notna()}).dropna(subset=["year"])
-    if coverage.empty:
-        return None
-    grouped = coverage.groupby("year")["has_timestamp"].agg(["count", "sum"])
-    full_years = sorted(int(idx) for idx, row in grouped.iterrows() if int(row["count"]) == int(row["sum"]))
+    full_years = sorted(
+        int(row["year"])
+        for row in df.to_dict("records")
+        if row.get("year") is not None
+        and int(row.get("row_count") or 0) == int(row.get("timestamp_count") or -1)
+    )
     if not full_years:
         return None
     suffix_start = full_years[-1]
@@ -650,23 +653,29 @@ def _usa_admin1_aliases_for_region_id(loc_id: str) -> tuple[str, ...]:
     if not geometry_path.exists():
         return ()
     try:
-        rows = pd.read_parquet(geometry_path, columns=["loc_id", "admin_level", "iso_3166_2"])
+        if re.fullmatch(r"USA-[A-Z]{2}", loc_text):
+            iso_3166_2 = f"US-{loc_text[-2:]}"
+            rows = run_df(
+                "SELECT loc_id, admin_level, iso_3166_2 FROM read_parquet(?) "
+                "WHERE admin_level = 1 AND upper(iso_3166_2) = ?",
+                [path_to_uri(geometry_path), iso_3166_2],
+            )
+        else:
+            rows = run_df(
+                "SELECT loc_id, admin_level, iso_3166_2 FROM read_parquet(?) "
+                "WHERE upper(loc_id) = ?",
+                [path_to_uri(geometry_path), loc_text],
+            )
     except Exception:
         return ()
     if re.fullmatch(r"USA-[A-Z]{2}", loc_text):
-        iso_3166_2 = f"US-{loc_text[-2:]}"
-        match = rows[
-            (rows["admin_level"].astype(str) == "1")
-            & (rows["iso_3166_2"].astype(str).str.upper() == iso_3166_2)
-        ]
-        if match.empty:
+        if rows.empty:
             return ()
-        return (str(match.iloc[0].get("loc_id") or "").strip(),)
+        return (str(rows.iloc[0].get("loc_id") or "").strip(),)
 
-    match = rows[rows["loc_id"].astype(str).str.upper() == loc_text]
-    if match.empty:
+    if rows.empty:
         return ()
-    row = match.iloc[0]
+    row = rows.iloc[0]
     try:
         admin_level = int(row.get("admin_level"))
     except (TypeError, ValueError):
@@ -1539,7 +1548,9 @@ def execute_dataset_query(
     having_params: list[Any] = []
 
     for col, value in (exact_filters or {}).items():
-        if col in available_cols and value is not None:
+        if col not in available_cols:
+            raise ValueError(f"Filter column {col!r} is absent from source {spec.source_id!r}")
+        if value is not None:
             alias_values = spec.filter_value_aliases.get(col, {}).get(str(value).strip().lower())
             if alias_values:
                 normalized_upper_values = [str(alias_value).upper() for alias_value in alias_values]
@@ -1556,7 +1567,11 @@ def execute_dataset_query(
 
     for col, values in (in_filters or {}).items():
         normalized_values = [value for value in (values or []) if value is not None]
-        if col in available_cols and normalized_values:
+        if col not in available_cols:
+            raise ValueError(f"Filter column {col!r} is absent from source {spec.source_id!r}")
+        if not normalized_values:
+            return []
+        if normalized_values:
             normalized_upper_values = [str(value).upper() for value in normalized_values]
             placeholders = ", ".join("?" for _ in normalized_upper_values)
             where_parts.append(f"upper({quote_ident(col)}) IN ({placeholders})")
@@ -1582,6 +1597,10 @@ def execute_dataset_query(
                 )
         if exact_or_descendant_parts:
             where_parts.append("(" + " OR ".join(exact_or_descendant_parts) + ")")
+        else:
+            raise ValueError(
+                f"Hierarchical filter {col!r} has no physical column in source {spec.source_id!r}"
+            )
 
     for col, op, value in (compare_filters or []):
         if value is None:
@@ -1597,6 +1616,8 @@ def execute_dataset_query(
         elif col in available_cols:
             where_parts.append(f"{quote_ident(col)} {op} ?")
             params.append(value)
+        else:
+            raise ValueError(f"Comparison column {col!r} is absent from source {spec.source_id!r}")
 
     order_parts: list[str] = []
     for sort_field, sort_direction in (sort_items or []):

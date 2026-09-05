@@ -7,6 +7,7 @@ this module compares the resulting identities and their selected geometries.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 from typing import Any, Callable
 
@@ -309,9 +310,9 @@ def _geodesic_area_km2(geometry: Any) -> float | None:
         return None
 
 
-def _spatial_relationship(left_geometry: dict[str, Any], right_geometry: dict[str, Any]) -> dict[str, Any]:
-    left = make_valid(shape(left_geometry))
-    right = make_valid(shape(right_geometry))
+def _spatial_relationship(left_geometry: Any, right_geometry: Any) -> dict[str, Any]:
+    left = make_valid(shape(left_geometry)) if isinstance(left_geometry, dict) else left_geometry
+    right = make_valid(shape(right_geometry)) if isinstance(right_geometry, dict) else right_geometry
     intersection = left.intersection(right)
     if left.equals(right):
         relation = "equals"
@@ -353,12 +354,16 @@ def compare_geographies(
     right_as_of: str | date | None = None,
     include_successors: bool = True,
     geometry_fetcher: Callable[..., dict[str, Any]] | None = None,
+    resolution_fetcher: Callable[[str], dict[str, Any]] | None = None,
+    identity_fetcher: Callable[[str, date | None], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compare two identities in time and, when available, exact geometry."""
     from .reference_exchange import resolve_loc_id_input
 
-    left_resolution = resolve_loc_id_input(left_loc_id)
-    right_resolution = resolve_loc_id_input(right_loc_id)
+    resolution_fetcher = resolution_fetcher or resolve_loc_id_input
+    identity_fetcher = identity_fetcher or _identity_state
+    left_resolution = resolution_fetcher(left_loc_id)
+    right_resolution = resolution_fetcher(right_loc_id)
     failed = [item for item in (left_resolution, right_resolution) if not item.get("ok")]
     if failed:
         return {
@@ -377,8 +382,8 @@ def compare_geographies(
     common_when = _parse_date(as_of, field="as_of")
     left_when = _parse_date(left_as_of, field="left_as_of") or common_when
     right_when = _parse_date(right_as_of, field="right_as_of") or common_when
-    left_identity = _identity_state(left_id, left_when)
-    right_identity = _identity_state(right_id, right_when)
+    left_identity = identity_fetcher(left_id, left_when)
+    right_identity = identity_fetcher(right_id, right_when)
     if left_resolution.get("resolved_from_public_alias"):
         left_identity["requested_loc_id"] = left_resolution.get("requested_loc_id")
         left_identity["resolved_from_public_alias"] = True
@@ -413,7 +418,12 @@ def compare_geographies(
             "reason": "one or more identities are not valid at the requested time",
         }
     elif left_geometry.get("geometry") and right_geometry.get("geometry"):
-        spatial = _spatial_relationship(left_geometry["geometry"], right_geometry["geometry"])
+        left_shape = left_geometry.get("_decoded_geometry")
+        right_shape = right_geometry.get("_decoded_geometry")
+        spatial = _spatial_relationship(
+            left_shape if left_shape is not None else left_geometry["geometry"],
+            right_shape if right_shape is not None else right_geometry["geometry"],
+        )
     else:
         spatial = {
             "spatial_relation": "geometry_unavailable",
@@ -434,3 +444,98 @@ def compare_geographies(
             "right_area_share": "fraction of the right geometry covered by the intersection",
         },
     }
+
+
+def compare_geographies_batch(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compare many pairs after resolving and hydrating each unique endpoint once."""
+    from .reference_exchange import get_geometry_references, resolve_loc_id_input
+
+    requested_ids: list[str] = []
+    seen_requested: set[str] = set()
+    for item in items:
+        for field in ("left_loc_id", "right_loc_id"):
+            requested = canonicalize_loc_id(str(item.get(field) or ""))
+            if requested and requested not in seen_requested:
+                seen_requested.add(requested)
+                requested_ids.append(requested)
+
+    resolutions = {requested: resolve_loc_id_input(requested) for requested in requested_ids}
+    canonical_ids: list[str] = []
+    seen_canonical: set[str] = set()
+    for resolution in resolutions.values():
+        canonical = canonicalize_loc_id(str(resolution.get("loc_id") or "")) if resolution.get("ok") else ""
+        if canonical and canonical not in seen_canonical:
+            seen_canonical.add(canonical)
+            canonical_ids.append(canonical)
+
+    geometry_results = (
+        get_geometry_references(canonical_ids, include_polygon=True, include_info=False).get("results") or []
+        if canonical_ids else []
+    )
+    geometries: dict[str, dict[str, Any]] = {}
+    for result in geometry_results:
+        canonical = canonicalize_loc_id(str(result.get("loc_id") or ""))
+        if not canonical:
+            continue
+        prepared = dict(result)
+        if prepared.get("geometry"):
+            prepared["_decoded_geometry"] = make_valid(shape(prepared["geometry"]))
+        geometries[canonical] = prepared
+
+    identity_cache: dict[tuple[str, date | None], dict[str, Any]] = {}
+
+    def cached_resolution(loc_id: str) -> dict[str, Any]:
+        canonical = canonicalize_loc_id(loc_id)
+        return resolutions.get(canonical) or resolve_loc_id_input(canonical)
+
+    def cached_geometry(loc_id: str, **_kwargs: Any) -> dict[str, Any]:
+        canonical = canonicalize_loc_id(loc_id)
+        return geometries.get(canonical) or {
+            "ok": False,
+            "loc_id": canonical,
+            "has_shape": False,
+            "error": "no geometry found",
+        }
+
+    def cached_identity(loc_id: str, when: date | None) -> dict[str, Any]:
+        key = (canonicalize_loc_id(loc_id), when)
+        if key not in identity_cache:
+            identity_cache[key] = _identity_state(key[0], when)
+        return deepcopy(identity_cache[key])
+
+    results: list[dict[str, Any]] = []
+    for item in items:
+        left_loc_id = str(item.get("left_loc_id") or "").strip()
+        right_loc_id = str(item.get("right_loc_id") or "").strip()
+        if not left_loc_id or not right_loc_id:
+            results.append({
+                "ok": False,
+                "error": {
+                    "code": "invalid_comparison",
+                    "message": "left_loc_id and right_loc_id are required",
+                },
+            })
+            continue
+        try:
+            results.append(compare_geographies(
+                left_loc_id,
+                right_loc_id,
+                as_of=item.get("as_of"),
+                left_as_of=item.get("left_as_of"),
+                right_as_of=item.get("right_as_of"),
+                include_successors=bool(item.get("include_successors", True)),
+                geometry_fetcher=cached_geometry,
+                resolution_fetcher=cached_resolution,
+                identity_fetcher=cached_identity,
+            ))
+        except ValueError as exc:
+            results.append({
+                "ok": False,
+                "error": {"code": "invalid_temporal_selector", "message": str(exc)},
+            })
+        except Exception as exc:
+            results.append({
+                "ok": False,
+                "error": {"code": "compare_geographies_failed", "message": str(exc)},
+            })
+    return results

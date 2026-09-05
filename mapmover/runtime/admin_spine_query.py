@@ -10,10 +10,11 @@ from shapely import from_wkb
 from shapely.geometry import Point
 import pandas as pd
 
-from ..duckdb_helpers import build_guarded_connection, is_cloud_mode, path_to_uri
+from ..duckdb_helpers import is_cloud_mode, lease_query_connection, path_to_uri
 from ..paths import COUNTRY_GEOMETRY_DIR, DATA_ROOT
 from .geometry_catalog import load_geometry_catalog
 from .published_artifacts import read_artifact_json
+from .geometry_spine import geometry_spine_index_for_frame
 
 
 META_COLUMNS = """
@@ -26,7 +27,6 @@ META_COLUMN_NAMES = [part.strip() for part in META_COLUMNS.replace("\n", " ").sp
 ROUTE_INDEX_NAME = "loc_id_routes.parquet"
 
 
-@lru_cache(maxsize=64)
 def layout_root(iso3: str) -> Path:
     country = str(iso3 or "").strip().upper()
     profiles = [
@@ -61,15 +61,19 @@ def layout_available(iso3: str) -> bool:
 
 
 def clear_admin_spine_query_cache() -> None:
-    layout_root.cache_clear()
     _published_layout_manifest_available.cache_clear()
-    _layout_manifest.cache_clear()
+    _layout_manifest_at_root.cache_clear()
 
 
-@lru_cache(maxsize=64)
 def _layout_manifest(iso3: str) -> dict[str, Any]:
     root = layout_root(iso3)
-    if not is_cloud_mode():
+    return _layout_manifest_at_root(str(root), is_cloud_mode())
+
+
+@lru_cache(maxsize=128)
+def _layout_manifest_at_root(root_text: str, cloud_mode: bool) -> dict[str, Any]:
+    root = Path(root_text)
+    if not cloud_mode:
         path = root / "manifest.json"
         if not path.is_file():
             return {}
@@ -102,26 +106,7 @@ def _published_layout_manifest_available(iso3: str, relative_path: str) -> bool:
 
 
 def _connection():
-    connection = build_guarded_connection()
-    connection.execute("SET memory_limit='400MB'")
-    connection.execute("SET threads=1")
-    connection.execute("SET preserve_insertion_order=false")
-    return connection
-
-
-def _metadata(connection, path: Path, lon: float, lat: float,
-              admin3: str = "") -> list[tuple]:
-    owner_clause = "" if not admin3 else " AND admin_3_loc_id = ?"
-    parameters: list[Any] = [path_to_uri(path), lon, lon, lat, lat]
-    if admin3:
-        parameters.append(admin3)
-    return connection.execute(f"""
-        SELECT {META_COLUMNS}
-        FROM read_parquet(?)
-        WHERE bbox_max_lon >= ? AND bbox_min_lon <= ?
-          AND bbox_max_lat >= ? AND bbox_min_lat <= ? {owner_clause}
-        ORDER BY admin_level, loc_id
-    """, parameters).fetchall()
+    return lease_query_connection()
 
 
 def _metadata_with_geometry(connection, path: Path, lon: float, lat: float,
@@ -145,6 +130,47 @@ def _metadata_with_geometry(connection, path: Path, lon: float, lat: float,
           AND bbox_max_lat >= ? AND bbox_min_lat <= ? {owner_clause}
         ORDER BY admin_level, loc_id
     """, parameters).fetchall()
+
+
+def _metadata_with_geometry_bbox(
+    connection,
+    path: Path,
+    points: list[dict[str, Any]],
+    *,
+    maximum_level: int | None = None,
+    admin3: str = "",
+) -> pd.DataFrame:
+    """Read each polygon in a batch envelope once, then match in one STRtree.
+
+    A point-by-point DuckDB query is catastrophic for large MCP batches even
+    when every individual read is selective.  The batch envelope may admit
+    more polygons, but each Parquet bank is scanned once and every WKB value is
+    decoded once instead of once per input point.
+    """
+    if not points:
+        return pd.DataFrame(columns=[*META_COLUMN_NAMES, "geometry"])
+    min_lon = min(float(point["lon"]) for point in points)
+    max_lon = max(float(point["lon"]) for point in points)
+    min_lat = min(float(point["lat"]) for point in points)
+    max_lat = max(float(point["lat"]) for point in points)
+    clauses = [
+        "bbox_max_lon >= ?", "bbox_min_lon <= ?",
+        "bbox_max_lat >= ?", "bbox_min_lat <= ?",
+    ]
+    parameters: list[Any] = [path_to_uri(path), min_lon, max_lon, min_lat, max_lat]
+    if maximum_level is not None:
+        clauses.append("admin_level <= ?")
+        parameters.append(int(maximum_level))
+    if admin3:
+        clauses.append("admin_3_loc_id = ?")
+        parameters.append(admin3)
+    cursor = connection.execute(
+        f"SELECT {META_COLUMNS}, ST_AsWKB(geometry) AS geometry "
+        f"FROM read_parquet(?) WHERE {' AND '.join(clauses)} "
+        "ORDER BY admin_level, loc_id",
+        parameters,
+    )
+    return cursor.fetchdf()
 
 
 def _identity_rows(connection, path: Path, loc_ids: list[str]) -> list[dict[str, Any]]:
@@ -181,26 +207,6 @@ def _exact_candidate_rows(rows: list[tuple], lon: float, lat: float) -> list[tup
         geometry = from_wkb(bytes(geometry_wkb))
         if geometry.covers(point):
             matches.append((row, bytes(geometry_wkb), float(geometry.area)))
-    return matches
-
-
-def _exact_rows(connection, path: Path, rows: list[tuple],
-                lon: float, lat: float) -> list[tuple[tuple, bytes, float]]:
-    if not rows:
-        return []
-    identifiers = [row[0] for row in rows]
-    placeholders = ",".join("?" for _ in identifiers)
-    shapes = dict(connection.execute(
-        f"SELECT loc_id, ST_AsWKB(geometry) FROM read_parquet(?) WHERE loc_id IN ({placeholders})",
-        [path_to_uri(path), *identifiers],
-    ).fetchall())
-    point = Point(lon, lat)
-    matches = []
-    for row in rows:
-        geometry_wkb = bytes(shapes[row[0]])
-        geometry = from_wkb(geometry_wkb)
-        if geometry.covers(point):
-            matches.append((row, geometry_wkb, float(geometry.area)))
     return matches
 
 
@@ -297,6 +303,125 @@ def resolve_point(
         connection.close()
 
 
+def resolve_points(
+    iso3: str,
+    points: list[dict[str, Any]],
+    *,
+    target_admin_level: int | None = None,
+) -> list[dict[str, Any]] | None:
+    """Resolve a point batch with one read/index pass per physical bank.
+
+    ``None`` means the country has no admitted layout and callers may use a
+    compatibility reader.  Once a layout is admitted, individual misses are
+    authoritative empty stacks and must not trigger a second broad scan.
+    """
+    country = str(iso3 or "").strip().upper()
+    point_items = list(points or [])
+    if not layout_available(country):
+        return None
+    if not point_items:
+        return []
+
+    root = layout_root(country)
+    target = None if target_admin_level is None else max(0, int(target_admin_level))
+    shallow_maximum = 3 if target is None else min(3, target)
+    connection = _connection()
+    try:
+        shallow = _metadata_with_geometry_bbox(
+            connection,
+            root / "admin_0_3.parquet",
+            point_items,
+            maximum_level=shallow_maximum,
+        )
+        matches: list[dict[int, dict[str, Any]]] = [dict() for _ in point_items]
+        if not shallow.empty:
+            for level in sorted(int(value) for value in shallow["admin_level"].dropna().unique()):
+                level_frame = shallow[shallow["admin_level"] == level].reset_index(drop=True)
+                index = geometry_spine_index_for_frame(level_frame)
+                level_matches = index.match_points(point_items) if index is not None else [None] * len(point_items)
+                for position, match in enumerate(level_matches):
+                    if match is not None:
+                        matches[position][level] = match.row.to_dict()
+
+        needs_deep = target is None or target > 3
+        if needs_deep:
+            by_owner: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+            for position, point in enumerate(point_items):
+                anchor = matches[position].get(3) or matches[position].get(2) or matches[position].get(1)
+                owner = str((anchor or {}).get("admin_1_loc_id") or "")
+                if owner:
+                    by_owner.setdefault(owner, []).append((position, point))
+            for owner, owned in by_owner.items():
+                deep_path = root / "deep" / f"{owner}.parquet"
+                if not is_cloud_mode() and not deep_path.is_file():
+                    continue
+                owned_points = [point for _, point in owned]
+                deep = _metadata_with_geometry_bbox(
+                    connection,
+                    deep_path,
+                    owned_points,
+                    maximum_level=target,
+                )
+                if deep.empty:
+                    continue
+                for level in sorted(int(value) for value in deep["admin_level"].dropna().unique()):
+                    level_frame = deep[deep["admin_level"] == level].reset_index(drop=True)
+                    index = geometry_spine_index_for_frame(level_frame)
+                    level_matches = index.match_points(owned_points) if index is not None else [None] * len(owned_points)
+                    for owned_position, match in enumerate(level_matches):
+                        if match is not None:
+                            original_position = owned[owned_position][0]
+                            matches[original_position][level] = match.row.to_dict()
+
+        outputs: list[dict[str, Any]] = []
+        missing_identity_ids: set[str] = set()
+        for levels in matches:
+            if not levels:
+                continue
+            deepest = levels[max(levels)]
+            for level in range(int(deepest.get("admin_level", 0)) + 1):
+                loc_id = str(deepest.get(f"admin_{level}_loc_id") or "").strip()
+                if loc_id and not any(str(row.get("loc_id") or "") == loc_id for row in levels.values()):
+                    missing_identity_ids.add(loc_id)
+
+        identities: dict[str, dict[str, Any]] = {}
+        if missing_identity_ids:
+            for row in _identity_rows(connection, root / "admin_0_3.parquet", sorted(missing_identity_ids)):
+                identities[str(row.get("loc_id") or "")] = row
+            remaining = missing_identity_ids - set(identities)
+            by_owner_ids: dict[str, list[str]] = {}
+            for loc_id in remaining:
+                parts = loc_id.split("-")
+                if len(parts) >= 2:
+                    by_owner_ids.setdefault("-".join(parts[:2]), []).append(loc_id)
+            for owner, loc_ids in by_owner_ids.items():
+                path = root / "deep" / f"{owner}.parquet"
+                if is_cloud_mode() or path.is_file():
+                    for row in _identity_rows(connection, path, loc_ids):
+                        identities[str(row.get("loc_id") or "")] = row
+
+        for levels in matches:
+            ordered = [levels[level] for level in sorted(levels)]
+            if ordered:
+                deepest = ordered[-1]
+                for level in range(int(deepest.get("admin_level", 0)) + 1):
+                    loc_id = str(deepest.get(f"admin_{level}_loc_id") or "").strip()
+                    if loc_id and not any(str(row.get("loc_id") or "") == loc_id for row in ordered):
+                        identity = identities.get(loc_id)
+                        if identity is not None:
+                            ordered.append(dict(identity, identity_only=True))
+                ordered.sort(key=lambda row: int(row.get("admin_level", 0)))
+            outputs.append({
+                "country": country,
+                "stack": ordered,
+                "matched": ordered[-1] if ordered else None,
+                "query_layout": True,
+            })
+        return outputs
+    finally:
+        connection.close()
+
+
 def load_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[str] | None = None) -> pd.DataFrame:
     """Load exact rows from an admitted country query layout.
 
@@ -378,5 +503,101 @@ def load_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[str] | Non
         order = {loc_id: index for index, loc_id in enumerate(requested)}
         result["_requested_order"] = result["loc_id"].map(order)
         return result.sort_values("_requested_order").drop(columns=["_requested_order"]).reset_index(drop=True)
+    finally:
+        connection.close()
+
+
+def query_descendant_scope(
+    iso3: str,
+    parent_loc_id: str,
+    target_admin_level: int,
+    *,
+    bbox: tuple[float, float, float, float] | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+    count_only: bool = False,
+) -> dict[str, Any] | None:
+    """Page descendants with one scan of the authoritative geometry bank.
+
+    The route index identifies the parent's level and Admin1 owner. The actual
+    result query then touches exactly one geometry Parquet: the national
+    Admin0-3 bank, or one Admin1-owned deep bank. Country-wide deep requests
+    deliberately return ``None`` because they span multiple physical banks.
+    """
+    country = str(iso3 or "").strip().upper()
+    parent = str(parent_loc_id or "").strip()
+    target = int(target_admin_level)
+    if not parent or not layout_available(country):
+        return None
+
+    root = layout_root(country)
+    route_path = root / ROUTE_INDEX_NAME
+    connection = _connection()
+    try:
+        route = connection.execute(
+            "SELECT admin_level, admin_1_loc_id FROM read_parquet(?) WHERE loc_id = ? LIMIT 1",
+            [path_to_uri(route_path), parent],
+        ).fetchone()
+        if route is None:
+            return {"rows": [], "total_count": 0, "single_bank": True}
+        parent_level = int(route[0])
+        owner = str(route[1] or "").strip()
+        if target <= parent_level:
+            return {"rows": [], "total_count": 0, "single_bank": True}
+        if target <= 3:
+            bank_path = root / "admin_0_3.parquet"
+        elif parent_level >= 1 and owner:
+            bank_path = root / "deep" / f"{owner}.parquet"
+        else:
+            return None
+        if not is_cloud_mode() and not bank_path.is_file():
+            return {"rows": [], "total_count": 0, "single_bank": True}
+
+        ancestry_column = f"admin_{parent_level}_loc_id"
+        clauses = ["admin_level = ?", f'"{ancestry_column}" = ?']
+        parameters: list[Any] = [path_to_uri(bank_path), target, parent]
+        if bbox is not None:
+            min_lon, min_lat, max_lon, max_lat = bbox
+            clauses.extend([
+                "bbox_max_lon >= ?", "bbox_min_lon <= ?",
+                "bbox_max_lat >= ?", "bbox_min_lat <= ?",
+            ])
+            parameters.extend([min_lon, max_lon, min_lat, max_lat])
+        where_clause = " AND ".join(clauses)
+        page_limit = None if limit is None else max(0, int(limit))
+        if count_only or page_limit == 0:
+            total = int(connection.execute(
+                f"SELECT count(*) FROM read_parquet(?) WHERE {where_clause}",
+                parameters,
+            ).fetchone()[0])
+            return {"rows": [], "total_count": total, "single_bank": True}
+
+        page_offset = max(0, int(offset))
+        page_parameters = [*parameters]
+        page_clause = ""
+        if page_limit is not None:
+            page_clause += " LIMIT ?"
+            page_parameters.append(page_limit)
+        if page_offset:
+            page_clause += " OFFSET ?"
+            page_parameters.append(page_offset)
+        frame = connection.execute(
+            f"SELECT {META_COLUMNS}, count(*) OVER () AS __total_count "
+            f"FROM read_parquet(?) WHERE {where_clause} ORDER BY loc_id{page_clause}",
+            page_parameters,
+        ).fetchdf()
+        if frame.empty:
+            # OFFSET beyond the final row loses the window count; use one small
+            # count query only for that uncommon pagination edge case.
+            total = 0
+            if page_offset:
+                total = int(connection.execute(
+                    f"SELECT count(*) FROM read_parquet(?) WHERE {where_clause}",
+                    parameters,
+                ).fetchone()[0])
+            return {"rows": [], "total_count": total, "single_bank": True}
+        total = int(frame["__total_count"].iloc[0])
+        rows = frame.drop(columns=["__total_count"]).to_dict("records")
+        return {"rows": rows, "total_count": total, "single_bank": True}
     finally:
         connection.close()

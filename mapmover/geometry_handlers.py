@@ -19,6 +19,7 @@ import threading
 import time
 import pandas as pd
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 
 # Try orjson for faster JSON parsing (3-10x faster than stdlib json)
@@ -55,6 +56,7 @@ from .runtime.admin_spine_query import (
     layout_available as admin_spine_layout_available,
     load_rows_by_loc_ids as load_admin_spine_query_rows,
     resolve_point as resolve_admin_spine_query_point,
+    resolve_points as resolve_admin_spine_query_points,
 )
 from .runtime.geometry_loader import resolve_country_geometry_source
 from .runtime.geometry_compatibility import (
@@ -64,6 +66,11 @@ from .runtime.geometry_compatibility import (
     retained_legacy_loc_ids,
 )
 from .runtime.geometry_spine import geometry_spine_index_for_frame, match_point_in_frame
+from .runtime.global_admin0_query import (
+    load_global_admin0_geometries,
+    load_global_admin0_identities,
+    resolve_global_admin0_query_points,
+)
 from .runtime.marine_geometry import load_marine_geometry
 from .runtime.reference_geometry_bank import load_reference_graph_geometry
 from .runtime.read_posture import geometry_read_mode, prefer_local_geometry_reads
@@ -336,12 +343,6 @@ def load_country_parquet(iso3: str, admin_level: int = None, columns: list[str] 
                     columns=read_columns,
                     exact_filters={"admin_level": admin_level},
                 )
-                if df.empty and not is_cloud_mode():
-                    df = pd.read_parquet(
-                        parquet_file,
-                        columns=read_columns,
-                        filters=[('admin_level', '==', admin_level)]
-                    )
         else:
             if parquet_file.exists():
                 df = pd.read_parquet(parquet_file, columns=read_columns)
@@ -475,26 +476,6 @@ def load_country_parquet_viewport(iso3: str, admin_level: int | None, bbox: tupl
                 compare_filters=compare_filters,
             )
 
-            if df.empty and not is_cloud_mode():
-                filters = []
-                if admin_level is not None:
-                    filters.append(("admin_level", "==", admin_level))
-                if has_bbox:
-                    filters.extend([
-                        ("bbox_max_lon", ">=", min_lon),
-                        ("bbox_min_lon", "<=", max_lon),
-                        ("bbox_max_lat", ">=", min_lat),
-                        ("bbox_min_lat", "<=", max_lat),
-                    ])
-                elif has_centroid:
-                    filters.extend([
-                        ("centroid_lon", ">=", min_lon),
-                        ("centroid_lon", "<=", max_lon),
-                        ("centroid_lat", ">=", min_lat),
-                        ("centroid_lat", "<=", max_lat),
-                    ])
-                df = pd.read_parquet(parquet_file, columns=read_columns, filters=filters)
-
         if crosswalk_data and not df.empty:
             _, reverse_map = build_crosswalk_maps(crosswalk_data)
             if "loc_id" in df.columns:
@@ -562,8 +543,15 @@ def _is_marine_family(family: str | None) -> bool:
     return str(family or "").strip().lower() in {"marine_eez", "water_body"}
 
 
+@lru_cache(maxsize=65536)
 def _geometry_family_for_loc_id(loc_id: str) -> str | None:
     """Prefer an explicit graph family, then fall back to legacy prefixes."""
+    # Explicit namespaces are authoritative and free to classify. Consulting
+    # a multi-million-row reference graph once per requested ID defeats every
+    # benefit of a set-based Parquet query (notably 10k ZCTA shape batches).
+    syntactic_family = classify_loc_id_family(loc_id)
+    if syntactic_family not in {None, "admin_local", "admin_geometry"}:
+        return syntactic_family
     try:
         from .runtime.reference_graph import identity as graph_identity
 
@@ -573,7 +561,7 @@ def _geometry_family_for_loc_id(loc_id: str) -> str | None:
             return family
     except Exception:
         pass
-    return classify_loc_id_family(loc_id)
+    return syntactic_family
 
 
 _UNSET_GEOMETRY_COLUMNS = object()
@@ -660,13 +648,10 @@ def load_geometry_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[s
 
     def _load_direct_family_bank(parquet_file: Path) -> pd.DataFrame:
         read_columns = _physical_parquet_columns(parquet_file, columns)
-        if prefer_local and parquet_file.exists():
-            return pd.read_parquet(
-                parquet_file,
-                columns=read_columns,
-                filters=[("loc_id", "in", requested_ids)],
-            )
         try:
+            # Keep local and cloud execution on the same DuckDB planner. A
+            # pandas/PyArrow local shortcut hides row-group and predicate
+            # regressions from the very benchmarks intended to catch them.
             df = select_rows(
                 parquet_file,
                 columns=read_columns,
@@ -675,12 +660,6 @@ def load_geometry_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[s
         except Exception as e:
             logger.error(f"Error loading geometry rows from {parquet_file}: {e}")
             df = pd.DataFrame()
-        if prefer_local and (df is None or df.empty) and parquet_file.exists():
-            df = pd.read_parquet(
-                parquet_file,
-                columns=read_columns,
-                filters=[("loc_id", "in", requested_ids)],
-            )
         return df if df is not None else pd.DataFrame()
 
     direct_family = next(iter(families), None) if len(families) == 1 else None
@@ -699,6 +678,13 @@ def load_geometry_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[s
     # families data-driven instead of extending a country/family allowlist.
     reference = load_reference_graph_geometry(requested_ids, columns=columns)
     if reference is not None and not reference.empty:
+        is_admin_request = all(
+            classify_loc_id_family(loc_id) in {"admin_geometry", "admin_local"}
+            for loc_id in requested_ids
+        )
+        if is_admin_request and "local_loc_id" not in reference.columns:
+            reference = reference.copy()
+            reference["local_loc_id"] = reference["loc_id"]
         return reference
 
     admin_source = resolve_country_geometry_source(iso3, admin_level=2)
@@ -746,13 +732,6 @@ def load_geometry_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[s
                         columns=read_columns,
                         in_filters={"loc_id": county_query_ids},
                     )
-
-                    if df.empty and not is_cloud_mode():
-                        df = pd.read_parquet(
-                            county_geom_file,
-                            columns=read_columns,
-                            filters=[("loc_id", "in", county_query_ids)],
-                        )
 
                 if not df.empty:
                     df = df.copy()
@@ -815,13 +794,6 @@ def load_geometry_rows_by_loc_ids(iso3: str, loc_ids: list[str], columns: list[s
                 columns=read_columns,
                 in_filters={"loc_id": query_ids},
             )
-
-            if df.empty and not is_cloud_mode():
-                df = pd.read_parquet(
-                    parquet_file,
-                    columns=read_columns,
-                    filters=[("loc_id", "in", query_ids)],
-                )
 
         # A country-specific spine has priority, but it is not necessarily a
         # complete replacement for the global GeoBoundaries namespace. Data
@@ -1379,11 +1351,14 @@ def resolve_point_to_location(lon: float, lat: float, include_geometry: bool = T
     lon = float(lon)
     lat = float(lat)
 
-    country_df = load_global_countries_frame()
-    if country_df is None or country_df.empty:
-        return {"error": "No global geometry available"}
-
-    country_match = _find_containing_country_with_fallback(country_df, lon, lat)
+    indexed_matches = resolve_global_admin0_query_points([{"lon": lon, "lat": lat}])
+    if indexed_matches is None:
+        country_df = load_global_countries_frame()
+        if country_df is None or country_df.empty:
+            return {"error": "No global geometry available"}
+        country_match = _find_containing_country_with_fallback(country_df, lon, lat)
+    else:
+        country_match = indexed_matches[0]
     if country_match is None:
         return {"error": "No containing country found", "point": {"lon": lon, "lat": lat}}
 
@@ -1605,20 +1580,24 @@ def resolve_points_to_locations(
                 early[target_index] = dict(source_result) if isinstance(source_result, dict) else source_result
         return [item or {"error": message} for item in early]
 
-    stage_started = time.perf_counter()
-    country_df = load_global_countries_frame()
-    _add_timing_ms(timing_ms, "global_country_load_ms", stage_started)
-    if country_df is None or country_df.empty:
-        return _deduplicated_error_results("No global geometry available")
-
     results: list[dict | None] = [None] * original_point_count
     by_country: dict[str, list[dict]] = {}
     stage_started = time.perf_counter()
     if scope_iso3:
-        scoped_rows = country_df[country_df["loc_id"].astype(str).str.upper() == scope_iso3] if "loc_id" in country_df.columns else pd.DataFrame()
-        if scoped_rows.empty:
+        identities = load_global_admin0_identities([scope_iso3])
+        if identities is None:
+            country_df = load_global_countries_frame()
+            _add_timing_ms(timing_ms, "global_country_fallback_load_ms", stage_started)
+            if country_df is None or country_df.empty:
+                return _deduplicated_error_results("No global geometry available")
+            scoped_rows = country_df[
+                country_df["loc_id"].astype(str).str.upper() == scope_iso3
+            ] if "loc_id" in country_df.columns else pd.DataFrame()
+            country_match = None if scoped_rows.empty else scoped_rows.iloc[0]
+        else:
+            country_match = identities.get(scope_iso3)
+        if country_match is None:
             return _deduplicated_error_results(f"Unknown country_scope {scope_iso3}")
-        country_match = scoped_rows.iloc[0]
         for item in normalized_points:
             if item.get("error"):
                 results[item["index"]] = {"error": item["error"]}
@@ -1628,22 +1607,28 @@ def resolve_points_to_locations(
             by_country.setdefault(scope_iso3, []).append(item)
         _add_timing_ms(timing_ms, "country_scope_ms", stage_started)
     else:
-        if len(normalized_points) <= 8:
-            # Building the global STRtree dominates an interactive one-point
-            # lookup. Its existing bbox shortlist is substantially faster for
-            # the map button and ordinary MCP calls.
-            country_matches = [
-                _find_containing_country_with_fallback(
-                    country_df, float(item.get("lon", 0)), float(item.get("lat", 0)),
-                ) if not item.get("error") else None
-                for item in normalized_points
-            ]
-            used_global_index = False
+        country_matches = resolve_global_admin0_query_points(normalized_points)
+        used_predicate_layout = country_matches is not None
+        if country_matches is None:
+            country_df = load_global_countries_frame()
+            _add_timing_ms(timing_ms, "global_country_fallback_load_ms", stage_started)
+            if country_df is None or country_df.empty:
+                return _deduplicated_error_results("No global geometry available")
+            if len(normalized_points) <= 8:
+                country_matches = [
+                    _find_containing_country_with_fallback(
+                        country_df, float(item.get("lon", 0)), float(item.get("lat", 0)),
+                    ) if not item.get("error") else None
+                    for item in normalized_points
+                ]
+                used_global_index = False
+            else:
+                country_index = geometry_spine_index_for_frame(country_df)
+                spine_matches = country_index.match_points(normalized_points) if country_index is not None else [None] * len(normalized_points)
+                country_matches = [match.row if match is not None else None for match in spine_matches]
+                used_global_index = True
         else:
-            country_index = geometry_spine_index_for_frame(country_df)
-            spine_matches = country_index.match_points(normalized_points) if country_index is not None else [None] * len(normalized_points)
-            country_matches = [match.row if match is not None else None for match in spine_matches]
-            used_global_index = True
+            used_global_index = False
         for item, country_match in zip(normalized_points, country_matches):
             if item.get("error"):
                 results[item["index"]] = {"error": item["error"]}
@@ -1663,7 +1648,7 @@ def resolve_points_to_locations(
                 if marine_result is not None:
                     results[item["index"]] = marine_result
                     continue
-                if used_global_index:
+                if used_global_index and not used_predicate_layout:
                     country_match = _find_containing_country_with_fallback(country_df, lon, lat)
             if country_match is None:
                 results[item["index"]] = {"error": "No containing country found", "point": {"lon": lon, "lat": lat}}
@@ -1681,11 +1666,12 @@ def resolve_points_to_locations(
         # Failed/unavailable layout lookups remain eligible for the legacy path.
         unresolved_items: list[dict] = []
         stage_started = time.perf_counter()
-        for item in country_items:
-            query_match = resolve_admin_spine_query_point(
-                iso3, float(item["lon"]), float(item["lat"]),
-                target_admin_level=target_admin_level,
-            )
+        query_matches = resolve_admin_spine_query_points(
+            iso3, country_items, target_admin_level=target_admin_level,
+        )
+        if query_matches is None:
+            query_matches = [None] * len(country_items)
+        for item, query_match in zip(country_items, query_matches):
             if query_match is None:
                 unresolved_items.append(item)
                 continue
@@ -1947,13 +1933,13 @@ def resolve_points_to_locations(
         and results[item["index"]].get("error") == "No containing country found"
     ]
     if marine_candidates:
-        from .runtime.loc_id_resolution import _resolve_point_to_marine_stack
+        from .runtime.loc_id_resolution import _resolve_points_to_marine_stacks
 
         stage_started = time.perf_counter()
-        for item in marine_candidates:
-            marine_result = _resolve_point_to_marine_stack(
-                float(item["lon"]), float(item["lat"]), include_geometry=include_geometry,
-            )
+        marine_results = _resolve_points_to_marine_stacks(
+            marine_candidates, include_geometry=include_geometry,
+        )
+        for item, marine_result in zip(marine_candidates, marine_results):
             if marine_result is not None:
                 results[item["index"]] = marine_result
         _add_timing_ms(timing_ms, "marine_match_ms", stage_started)
@@ -1962,6 +1948,11 @@ def resolve_points_to_locations(
     # marine families (for example a census water polygon plus an EEZ). Keep
     # the admin spine as the primary answer, but expose the marine context as
     # parallel overlaps instead of making callers choose one geometry domain.
+    # A country-scoped bulk request is deliberately one physical/semantic
+    # query group. Do not silently open Marine banks after the selected
+    # country's admin file has answered it; callers can run a separate Marine
+    # scope. Unscoped interactive resolution still includes truthful coastal
+    # overlaps such as EEZ context.
     admin_candidates = [
         item for item in normalized_points
         if not item.get("error")
@@ -1969,14 +1960,14 @@ def resolve_points_to_locations(
         and not results[item["index"]].get("error")
         and results[item["index"]].get("country")
     ]
-    if admin_candidates:
-        from .runtime.loc_id_resolution import _resolve_point_to_marine_stack
+    if admin_candidates and not scope_iso3:
+        from .runtime.loc_id_resolution import _resolve_points_to_marine_stacks
 
         stage_started = time.perf_counter()
-        for item in admin_candidates:
-            marine_result = _resolve_point_to_marine_stack(
-                float(item["lon"]), float(item["lat"]), include_geometry=False,
-            )
+        marine_results = _resolve_points_to_marine_stacks(
+            admin_candidates, include_geometry=False,
+        )
+        for item, marine_result in zip(admin_candidates, marine_results):
             if marine_result is None:
                 continue
             result = results[item["index"]]
@@ -2783,6 +2774,53 @@ def _build_metadata_based_location_info(
         "geometry_source": props.get("geometry_source"),
     }
     return _append_location_version_metadata(result, props)
+
+
+def get_location_infos(
+    loc_ids: list[str],
+    *,
+    include_memberships: bool = False,
+    fallback: bool = True,
+) -> list[dict]:
+    """Return location metadata with one grouped geometry-metadata pipeline.
+
+    The popup-oriented singular helper has several compatibility branches.
+    MCP batches should not repeat those branches for every identifier when the
+    exact metadata banks can answer the whole request together.
+    """
+    requested = [str(loc_id or "").strip() for loc_id in loc_ids if str(loc_id or "").strip()]
+    if not requested:
+        return []
+    unique = list(dict.fromkeys(requested))
+    rows = get_selection_geometry_metadata(unique)
+    by_loc_id = {
+        str(row.get("loc_id") or row.get("source_loc_id") or "").strip(): row
+        for row in rows
+        if str(row.get("loc_id") or row.get("source_loc_id") or "").strip()
+    }
+    info_by_loc_id: dict[str, dict] = {}
+    for loc_id in unique:
+        row = by_loc_id.get(loc_id)
+        if row is not None:
+            info_by_loc_id[loc_id] = _build_metadata_based_location_info(
+                loc_id,
+                row,
+                include_memberships=include_memberships,
+            )
+            continue
+        if not fallback:
+            info_by_loc_id[loc_id] = {"loc_id": loc_id, "error": "no geometry metadata found"}
+            continue
+        # Retain compatibility for graph-only or legacy identities while
+        # ensuring duplicate inputs pay this fallback at most once.
+        try:
+            info_by_loc_id[loc_id] = get_location_info(
+                loc_id,
+                include_memberships=include_memberships,
+            )
+        except Exception as exc:
+            info_by_loc_id[loc_id] = {"loc_id": loc_id, "error": str(exc)}
+    return [info_by_loc_id[loc_id] for loc_id in requested]
 
 
 def _build_feature_based_location_info(loc_id: str, feature: dict) -> dict:
@@ -3671,11 +3709,30 @@ def get_selection_geometries(loc_ids: list):
             graph_shape_ids = _reference_graph_shape_owned_ids(unresolved) if unresolved else set()
             query_layout_ids.update(set(country_ids) - graph_shape_ids)
 
-    # Graph-owned semantic-family partitions are authoritative for IDs the
-    # admin query layout did not claim. This preserves sidechain IDs whose
-    # punctuation resembles an administrative path while keeping the normal
-    # admitted-admin path bounded by the route index.
-    graph_requests = [loc_id for loc_id in requested_ids if loc_id not in query_layout_ids]
+    # Explicit family namespaces route straight to their single physical bank.
+    # A 10k ZCTA request must be one projected ``loc_id IN`` query, not 10k
+    # reference-graph identity probes followed by the same bank query.
+    direct_family_ids: set[str] = set()
+    direct_groups: dict[tuple[str, str], list[str]] = {}
+    for loc_id in requested_ids:
+        if loc_id in query_layout_ids:
+            continue
+        iso3 = loc_id.split("-", 1)[0].upper()
+        family = classify_loc_id_family(loc_id)
+        if _direct_family_bank_path(family, iso3) is not None:
+            direct_groups.setdefault((iso3, str(family)), []).append(loc_id)
+    for (iso3, _family), family_ids in direct_groups.items():
+        frame = load_geometry_rows_by_loc_ids(iso3, family_ids)
+        if frame is not None and not frame.empty:
+            direct_family_ids.update(frame["loc_id"].astype(str))
+            features.extend(df_to_geojson(frame, polygon_only=True).get("features", []))
+
+    # Graph-owned semantic-family partitions are authoritative for unresolved
+    # IDs whose namespace did not select an admitted admin/direct-family bank.
+    graph_requests = [
+        loc_id for loc_id in requested_ids
+        if loc_id not in query_layout_ids and loc_id not in direct_family_ids
+    ]
     reference_df = load_reference_graph_geometry(graph_requests) if graph_requests else pd.DataFrame()
     reference_ids: set[str] = set()
     if reference_df is not None and not reference_df.empty:
@@ -3689,7 +3746,7 @@ def get_selection_geometries(loc_ids: list):
         if loc_id not in reference_ids
         if _geometry_family_for_loc_id(loc_id) in {"marine_eez", "water_body"}
     ]
-    claimed_ids = query_layout_ids | reference_ids | set(marine_ids)
+    claimed_ids = query_layout_ids | direct_family_ids | reference_ids | set(marine_ids)
     remaining_ids = [loc_id for loc_id in requested_ids if loc_id not in claimed_ids]
 
     if marine_ids:
@@ -3703,7 +3760,11 @@ def get_selection_geometries(loc_ids: list):
     # display frame once avoids repeating that work for each country.
     country_level_ids = [loc_id for loc_id in remaining_ids if "-" not in loc_id]
     if country_level_ids:
-        global_df = load_global_country_display_frame()
+        # Shape tools require Full geometry. The simplified Admin0 frame is a
+        # display derivative and cannot answer exact retrieval or border work.
+        global_df = load_global_admin0_geometries(country_level_ids)
+        if global_df is None:
+            global_df = load_global_countries_frame()
         if global_df is not None:
             country_rows = global_df[global_df["loc_id"].isin(country_level_ids)]
             if len(country_rows) > 0:
@@ -3889,7 +3950,30 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
             graph_shape_ids = _reference_graph_shape_owned_ids(unresolved) if unresolved else set()
             query_layout_ids.update(set(country_ids) - graph_shape_ids)
 
-    graph_requests = [loc_id for loc_id in requested_ids if loc_id not in query_layout_ids]
+    direct_family_ids: set[str] = set()
+    direct_groups: dict[tuple[str, str], list[str]] = {}
+    for loc_id in requested_ids:
+        if loc_id in query_layout_ids:
+            continue
+        iso3 = loc_id.split("-", 1)[0].upper()
+        family = classify_loc_id_family(loc_id)
+        if _direct_family_bank_path(family, iso3) is not None:
+            direct_groups.setdefault((iso3, str(family)), []).append(loc_id)
+    for (iso3, _family), family_ids in direct_groups.items():
+        frame = load_geometry_rows_by_loc_ids(
+            iso3, family_ids, columns=GEOMETRY_METADATA_COLUMNS,
+        )
+        if frame is not None and not frame.empty:
+            direct_family_ids.update(frame["loc_id"].astype(str))
+            for _, row in frame.iterrows():
+                item = _geometry_metadata_row(row)
+                if item.get("loc_id"):
+                    rows.append(item)
+
+    graph_requests = [
+        loc_id for loc_id in requested_ids
+        if loc_id not in query_layout_ids and loc_id not in direct_family_ids
+    ]
     reference_df = (
         load_reference_graph_geometry(graph_requests, columns=GEOMETRY_METADATA_COLUMNS)
         if graph_requests else
@@ -3909,7 +3993,7 @@ def get_selection_geometry_metadata(loc_ids: list) -> list[dict]:
         if loc_id not in reference_ids
         if _geometry_family_for_loc_id(loc_id) in {"marine_eez", "water_body"}
     ]
-    claimed_ids = query_layout_ids | reference_ids | set(marine_ids)
+    claimed_ids = query_layout_ids | direct_family_ids | reference_ids | set(marine_ids)
     remaining_ids = [loc_id for loc_id in requested_ids if loc_id not in claimed_ids]
 
     if marine_ids:

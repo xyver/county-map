@@ -395,6 +395,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         admin2_row = {"loc_id": "USA-G125186-G215213", "name": "Fairfax", "admin_level": 2}
 
         with (
+            patch("mapmover.geometry_handlers.resolve_global_admin0_query_points", return_value=None),
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=_Frame()),
             patch("mapmover.geometry_handlers.load_country_parquet_viewport", return_value=_Frame()),
             patch("mapmover.geometry_handlers.load_country_parquet", return_value=_Frame()),
@@ -462,6 +463,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         )
 
         with (
+            patch("mapmover.geometry_handlers.resolve_global_admin0_query_points", return_value=None),
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=country_df),
             patch(
                 "mapmover.geometry_handlers.load_country_parquet",
@@ -499,8 +501,8 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         with (
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=country_df),
             patch(
-                "mapmover.geometry_handlers.resolve_admin_spine_query_point",
-                return_value=query_match,
+                "mapmover.geometry_handlers.resolve_admin_spine_query_points",
+                return_value=[query_match],
             ),
             patch("mapmover.geometry_handlers.load_country_parquet_viewport") as legacy_load,
         ):
@@ -565,6 +567,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         with (
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=country_df),
+            patch("mapmover.geometry_handlers.resolve_admin_spine_query_points", return_value=None),
             patch("mapmover.geometry_handlers.load_country_parquet_viewport", side_effect=[admin1_df, admin2_df]) as viewport_mock,
             patch("mapmover.geometry_handlers.get_country_supported_deep_admin_levels", return_value=[]),
         ):
@@ -647,6 +650,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         with (
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=country_df),
+            patch("mapmover.geometry_handlers.resolve_admin_spine_query_points", return_value=None),
             patch("mapmover.geometry_handlers.load_country_parquet_viewport", return_value=admin1_df) as viewport_mock,
             patch("mapmover.geometry_handlers.get_country_supported_deep_admin_levels", return_value=[]),
         ):
@@ -699,6 +703,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         with (
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=country_df),
+            patch("mapmover.geometry_handlers.resolve_admin_spine_query_points", return_value=None),
             patch("mapmover.geometry_handlers.load_country_parquet_viewport", side_effect=[admin1_df, admin2_df]),
             patch("mapmover.geometry_handlers.get_country_supported_deep_admin_levels", return_value=[]),
             patch("mapmover.geometry_handlers._find_containing_country_with_fallback") as country_fallback,
@@ -751,6 +756,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         with (
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=country_df),
+            patch("mapmover.geometry_handlers.resolve_admin_spine_query_points", return_value=None),
             patch("mapmover.geometry_handlers.load_country_parquet_viewport", side_effect=[admin1_df, admin2_df]),
             patch("mapmover.geometry_handlers.get_country_supported_deep_admin_levels", return_value=[]),
         ):
@@ -841,6 +847,7 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
 
         with (
             patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=country_df),
+            patch("mapmover.geometry_handlers.resolve_admin_spine_query_points", return_value=None),
             patch("mapmover.geometry_handlers.load_country_parquet_viewport", side_effect=[admin1_df, admin2_df]),
             patch("mapmover.geometry_handlers.get_country_supported_deep_admin_levels", return_value=[3, 4, 5]),
             patch("mapmover.geometry_handlers.load_subcounty_geometry", side_effect=deep_frames) as deep_mock,

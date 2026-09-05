@@ -156,10 +156,16 @@ def clear_geometry_catalog_cache() -> None:
 
     clear_geometry_inventory_cache()
     from .admin_spine_query import clear_admin_spine_query_cache
+    from .global_admin0_query import clear_global_admin0_query_cache
+    from .marine_geometry import clear_marine_geometry_cache
     from .reference_graph import clear_reference_graph_cache
+    from ..duckdb_helpers import clear_parquet_metadata_cache
 
     clear_admin_spine_query_cache()
+    clear_global_admin0_query_cache()
+    clear_marine_geometry_cache()
     clear_reference_graph_cache()
+    clear_parquet_metadata_cache()
 
 
 def geometry_capability_summary(catalog: dict[str, Any] | None = None) -> dict[str, Any]:

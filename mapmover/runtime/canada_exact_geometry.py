@@ -8,7 +8,7 @@ from typing import Any
 
 import shapely
 
-from ..duckdb_helpers import build_guarded_connection, parquet_columns, path_to_uri
+from ..duckdb_helpers import lease_query_connection, parquet_columns, path_to_uri
 from ..paths import DATA_ROOT
 
 
@@ -102,9 +102,7 @@ def resolve_canada_query_exact_points(
         except (KeyError, TypeError, ValueError):
             results[index] = {"error": "invalid point"}
 
-    connection = build_guarded_connection()
-    if connection is None:
-        raise RuntimeError("DuckDB is required for exact Canada containment")
+    connection = lease_query_connection()
     matches_by_point: dict[int, dict[int, dict]] = {item["index"]: {} for item in normalized}
     try:
         for level in range(0, min(target, 1) + 1):

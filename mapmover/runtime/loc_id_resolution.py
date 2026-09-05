@@ -25,7 +25,7 @@ from .geography_reference import (
     load_conversions,
     translate_geometry_id_to_local_id,
 )
-from .marine_geometry import load_marine_geometry_at_point
+from .marine_geometry import load_marine_geometry_at_point, load_marine_geometry_for_points
 from .place_lookup import resolve_populated_place
 
 _LOC_ID_RE = re.compile(r"^[A-Z]{3}(?:-[A-Z0-9]+)+$|^[A-Z]{3}$")
@@ -94,8 +94,12 @@ def _resolve_point_to_marine_stack(
     lat: float,
     *,
     include_geometry: bool = False,
+    marine_df: pd.DataFrame | None = None,
+    candidate_loc_ids: set[str] | None = None,
+    geometry_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    marine_df = load_marine_geometry_at_point(lon, lat)
+    if marine_df is None:
+        marine_df = load_marine_geometry_at_point(lon, lat)
     if marine_df is None or marine_df.empty:
         return None
 
@@ -106,6 +110,10 @@ def _resolve_point_to_marine_stack(
 
     point = Point(float(lon), float(lat))
     candidates = marine_df
+    if candidate_loc_ids is not None:
+        candidates = candidates[candidates["loc_id"].astype(str).isin(candidate_loc_ids)]
+        if candidates.empty:
+            return None
     bbox_cols = {"bbox_min_lon", "bbox_max_lon", "bbox_min_lat", "bbox_max_lat"}
     if bbox_cols.issubset(set(marine_df.columns)):
         candidates = marine_df[
@@ -132,15 +140,19 @@ def _resolve_point_to_marine_stack(
         if not geom_value:
             continue
         try:
-            if isinstance(geom_value, (bytes, bytearray, memoryview)):
-                from shapely import wkb
+            exact_shape = geometry_cache.get(loc_id) if geometry_cache is not None else None
+            if exact_shape is None:
+                if isinstance(geom_value, (bytes, bytearray, memoryview)):
+                    from shapely import wkb
 
-                exact_shape = wkb.loads(bytes(geom_value))
-            else:
-                geometry = json.loads(geom_value) if isinstance(geom_value, str) else geom_value
-                if not geometry or geometry.get("type") == "Point":
-                    continue
-                exact_shape = shape(geometry)
+                    exact_shape = wkb.loads(bytes(geom_value))
+                else:
+                    geometry = json.loads(geom_value) if isinstance(geom_value, str) else geom_value
+                    if not geometry or geometry.get("type") == "Point":
+                        continue
+                    exact_shape = shape(geometry)
+                if geometry_cache is not None:
+                    geometry_cache[loc_id] = exact_shape
             if exact_shape.geom_type == "Point" or not exact_shape.covers(point):
                 continue
         except Exception:
@@ -223,6 +235,36 @@ def _resolve_point_to_marine_stack(
     if include_geometry:
         result["geojson"] = get_selection_geometries([deepest["loc_id"]])
     return result
+
+
+def _resolve_points_to_marine_stacks(
+    points: list[dict[str, Any]],
+    *,
+    include_geometry: bool = False,
+) -> list[dict[str, Any] | None]:
+    """Resolve Marine overlaps with one candidate/hydration pass per batch."""
+    point_items = list(points or [])
+    batch = load_marine_geometry_for_points(point_items)
+    if batch is None:
+        return [
+            _resolve_point_to_marine_stack(
+                float(point["lon"]), float(point["lat"]),
+                include_geometry=include_geometry,
+            )
+            for point in point_items
+        ]
+    marine_df, candidate_ids = batch
+    geometry_cache: dict[str, Any] = {}
+    return [
+        _resolve_point_to_marine_stack(
+            float(point["lon"]), float(point["lat"]),
+            include_geometry=include_geometry,
+            marine_df=marine_df,
+            candidate_loc_ids=set(candidate_ids.get(position, [])),
+            geometry_cache=geometry_cache,
+        )
+        for position, point in enumerate(point_items)
+    ]
 
 
 def _get_name_standardizer() -> NameStandardizer:

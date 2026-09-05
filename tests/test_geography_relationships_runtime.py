@@ -7,6 +7,7 @@ from shapely.geometry import Polygon, mapping
 
 from mapmover.runtime.geography_relationships import (
     compare_geographies,
+    compare_geographies_batch,
     historical_entity_info,
     resolve_historical_country_reference,
 )
@@ -79,6 +80,46 @@ class GeographyRelationshipRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(result["left_area_share"], 0.5, places=3)
         self.assertAlmostEqual(result["right_area_share"], 1 / 3, places=3)
         self.assertGreater(result["intersection_area_km2"], 0)
+
+    def test_compare_geographies_batch_hydrates_unique_endpoints_once(self) -> None:
+        geometries = {
+            "LEFT": _feature("LEFT", Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])),
+            "RIGHT": _feature("RIGHT", Polygon([(1, 0), (4, 0), (4, 2), (1, 2)])),
+        }
+
+        def resolve(loc_id: str) -> dict:
+            return {
+                "ok": True,
+                "requested_loc_id": loc_id,
+                "loc_id": loc_id,
+                "resolved_from_public_alias": False,
+            }
+
+        with (
+            mock.patch("mapmover.runtime.reference_exchange.resolve_loc_id_input", side_effect=resolve) as resolve_mock,
+            mock.patch(
+                "mapmover.runtime.reference_exchange.get_geometry_references",
+                return_value={"results": [geometries["LEFT"], geometries["RIGHT"]]},
+            ) as geometry_mock,
+            mock.patch(
+                "mapmover.runtime.geography_relationships._identity_state",
+                side_effect=lambda loc_id, _when: {
+                    "loc_id": loc_id,
+                    "valid_at_requested_time": None,
+                    "direct_successors": [],
+                    "present_day_descendants": [],
+                },
+            ) as identity_mock,
+        ):
+            results = compare_geographies_batch([
+                {"left_loc_id": "LEFT", "right_loc_id": "RIGHT"},
+                {"left_loc_id": "RIGHT", "right_loc_id": "LEFT"},
+            ])
+
+        self.assertEqual([result["spatial_relation"] for result in results], ["overlaps", "overlaps"])
+        self.assertEqual(resolve_mock.call_count, 2)
+        geometry_mock.assert_called_once_with(["LEFT", "RIGHT"], include_polygon=True, include_info=False)
+        self.assertEqual(identity_mock.call_count, 2)
 
     def test_invalid_historical_identity_does_not_reuse_current_geometry(self) -> None:
         result = compare_geographies(

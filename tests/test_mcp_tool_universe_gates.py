@@ -434,7 +434,7 @@ class TrustedArtifactBypassTests(unittest.TestCase):
         self.assertEqual(analytics_mock.call_args.kwargs["payment_rail"], ACCESS_LANE_TRUSTED_ARTIFACT)
         self.assertTrue(analytics_mock.call_args.kwargs["metadata"]["rate_limit_bypassed"])
 
-    def test_local_runtime_bypasses_rate_and_item_caps(self) -> None:
+    def test_local_runtime_bypasses_rate_but_keeps_item_caps(self) -> None:
         with (
             mock.patch("mapmover.routes.mcp.is_local_loopback_request", return_value=True),
             mock.patch("mapmover.routes.mcp.rate_limiter.check", return_value=(False, 60)) as limiter_mock,
@@ -464,10 +464,14 @@ class TrustedArtifactBypassTests(unittest.TestCase):
 
         access = help_envelope["result"]["structuredContent"]["access"]
         self.assertEqual(access["access_lane"], "local_installed")
-        self.assertEqual(access["limits"], {})
+        self.assertEqual(access["limits"]["free_item_limit"], 2)
         self.assertFalse(access["rate_limited_independently"])
-        self.assertFalse(access["service_item_caps_enforced"])
-        self.assertEqual(create_envelope["result"]["structuredContent"]["status"], "completed")
+        self.assertTrue(access["service_item_caps_enforced"])
+        self.assertFalse(access["payment_required"])
+        self.assertEqual(
+            create_envelope["result"]["structuredContent"]["error"]["code"],
+            "bounded_inline_limit_exceeded",
+        )
         limiter_mock.assert_not_called()
 
 

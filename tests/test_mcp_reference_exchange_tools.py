@@ -873,6 +873,47 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         self.assertEqual(payload["requested_loc_id"], "USA-PLACE-SPRINGFIELD-IL")
         self.assertTrue(payload["resolved_from_public_alias"])
 
+    def test_loc_id_info_batch_fetches_unique_metadata_once(self) -> None:
+        def resolve(loc_id: str) -> dict:
+            return {
+                "ok": True,
+                "requested_loc_id": loc_id,
+                "loc_id": loc_id,
+                "resolved_from_public_alias": False,
+            }
+
+        infos = [
+            {"loc_id": "USA-CA-037", "name": "Los Angeles County", "admin_level": 2, "iso3": "USA"},
+            {"loc_id": "USA-NY-061", "name": "New York County", "admin_level": 2, "iso3": "USA"},
+        ]
+        with (
+            mock.patch(
+                "mapmover.runtime.reference_exchange.resolve_loc_id_input",
+                side_effect=resolve,
+            ) as resolve_mock,
+            mock.patch(
+                "mapmover.geometry_handlers.get_location_infos",
+                return_value=infos,
+            ) as info_mock,
+        ):
+            payload = _tool_call(
+                self.client,
+                "loc_id_info",
+                {"loc_ids": ["USA-CA-037", "USA-NY-061", "USA-CA-037"]},
+            )
+
+        self.assertEqual(payload["found_count"], 3)
+        resolve_mock.assert_not_called()
+        info_mock.assert_called_once_with(
+            ["USA-CA-037", "USA-NY-061"],
+            include_memberships=False,
+            fallback=False,
+        )
+        self.assertEqual(
+            [result["loc_id"] for result in payload["results"]],
+            ["USA-CA-037", "USA-NY-061", "USA-CA-037"],
+        )
+
     def test_loc_id_info_rejects_ambiguous_preferred_public_alias(self) -> None:
         with (
             mock.patch(
@@ -1319,6 +1360,21 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         # The real analytics rows carry compute.input_count/output_count and
         # crosswalk_lookup_ms; other tests assert the shared shape with mocks.
 
+    def test_resolve_reference_batch_uses_one_set_based_runtime_call(self) -> None:
+        with mock.patch(
+            "mapmover.runtime.reference_exchange.resolve_references_batch",
+            return_value=[{"ok": True, "resolved_loc_id": "USA-PR-001"}],
+        ) as batch_mock:
+            payload = _tool_call(
+                self.client,
+                "resolve_reference",
+                {"from_system": "zip", "items": [{"value": "00601"}]},
+            )
+
+        self.assertEqual(payload["resolved_count"], 1)
+        batch_mock.assert_called_once()
+        self.assertEqual(batch_mock.call_args.args[0][0]["value"], "00601")
+
     def test_resolve_reference_tool_uses_per_tool_batch_limit_override(self) -> None:
         with mock.patch.dict("os.environ", {"MCP_TOOL_BATCH_LIMIT_RESOLVE_REFERENCE": "1"}):
             payload = _tool_call(
@@ -1393,6 +1449,25 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         self.assertEqual(payload["converted_count"], 1)
         self.assertEqual(payload["unconverted_count"], 1)
 
+    def test_convert_reference_batch_uses_one_set_based_runtime_call(self) -> None:
+        with mock.patch(
+            "mapmover.runtime.reference_exchange.convert_references_batch",
+            return_value=[{"ok": True, "loc_id": "USA-PR-001", "results": []}],
+        ) as batch_mock:
+            payload = _tool_call(
+                self.client,
+                "convert_reference",
+                {
+                    "from_system": "zip",
+                    "to_system": "nws_fire",
+                    "items": [{"value": "00601"}],
+                },
+            )
+
+        self.assertEqual(payload["converted_count"], 1)
+        batch_mock.assert_called_once()
+        self.assertEqual(batch_mock.call_args.args[0][0]["value"], "00601")
+
     def test_convert_reference_tool_normalizes_string_error(self) -> None:
         with (
             mock.patch(
@@ -1463,9 +1538,12 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
 
     def test_compare_geographies_tool_accepts_pair_batch(self) -> None:
         with mock.patch(
-            "mapmover.runtime.geography_relationships.compare_geographies",
-            return_value={"ok": True, "spatial_relation": "disjoint"},
-        ):
+            "mapmover.runtime.geography_relationships.compare_geographies_batch",
+            return_value=[
+                {"ok": True, "spatial_relation": "disjoint"},
+                {"ok": True, "spatial_relation": "disjoint"},
+            ],
+        ) as compare_mock:
             payload = _tool_call(
                 self.client,
                 "compare_geographies",
@@ -1482,9 +1560,12 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         self.assertEqual(payload["item_count"], 2)
         self.assertEqual(payload["compared_count"], 2)
         self.assertEqual([row["row_index"] for row in payload["results"]], ["one", "two"])
+        compare_mock.assert_called_once()
+        self.assertEqual(len(compare_mock.call_args.args[0]), 2)
 
     def test_resolve_loc_id_scope_uses_geometry_index(self) -> None:
         with (
+            mock.patch("mapmover.runtime.geometry_tool_jobs.query_descendant_scope", return_value=None),
             mock.patch(
                 "mapmover.runtime.geometry_tool_jobs.get_geometry_index",
                 return_value={
@@ -1532,6 +1613,7 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         )
 
         with (
+            mock.patch("mapmover.runtime.geometry_tool_jobs.query_descendant_scope", return_value=None),
             mock.patch("mapmover.runtime.geometry_tool_jobs.get_geometry_index", return_value={"rows": [], "count": 0}) as index_mock,
             mock.patch("mapmover.runtime.geometry_tool_jobs.load_country_parquet", return_value=base_rows) as base_mock,
             mock.patch("mapmover.routes.mcp.log_api_query_event"),
@@ -1552,6 +1634,35 @@ class McpReferenceExchangeToolsTests(unittest.TestCase):
         self.assertEqual(payload["returned_count"], 2)
         self.assertTrue(payload["truncated"])
         self.assertEqual(payload["loc_ids"], ["USA-MN-001", "USA-MN-003"])
+
+    def test_resolve_loc_id_scope_pages_one_admin1_owned_deep_bank(self) -> None:
+        direct = {
+            "rows": [
+                {"loc_id": "USA-TX-001-950100-1-000", "parent_id": "USA-TX-001-950100-1", "admin_level": 5, "name": "Block 1000"},
+            ],
+            "total_count": 668757,
+            "single_bank": True,
+        }
+        with (
+            mock.patch("mapmover.runtime.geometry_tool_jobs.get_country_supported_deep_admin_levels", return_value=[4, 5]),
+            mock.patch("mapmover.runtime.geometry_tool_jobs.query_descendant_scope", return_value=direct) as scope_mock,
+            mock.patch("mapmover.runtime.geometry_tool_jobs.get_geometry_index") as legacy_mock,
+            mock.patch("mapmover.routes.mcp.log_api_query_event"),
+        ):
+            payload = _tool_call(
+                self.client,
+                "resolve_loc_id_scope",
+                {"parent_loc_id": "USA-TX", "admin_level": "admin_5", "limit": 1},
+            )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["total_count"], 668757)
+        self.assertEqual(payload["returned_count"], 1)
+        self.assertTrue(payload["truncated"])
+        scope_mock.assert_called_once_with(
+            "USA", "USA-TX", 5, bbox=None, limit=1, offset=0, count_only=False,
+        )
+        legacy_mock.assert_not_called()
 
     def test_resolve_loc_id_scope_rejects_unsupported_deep_country_level(self) -> None:
         with (

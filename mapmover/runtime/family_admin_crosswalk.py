@@ -65,13 +65,9 @@ def _read_crosswalk_rows(
     exact_filters: dict[str, Any] | None = None,
     in_filters: dict[str, list[Any]] | None = None,
 ) -> pd.DataFrame:
-    if crosswalk_path.exists():
-        filters = [(key, "==", value) for key, value in (exact_filters or {}).items()]
-        filters.extend((key, "in", values) for key, values in (in_filters or {}).items() if values)
-        return pd.read_parquet(crosswalk_path, filters=filters)
-    if is_cloud_mode():
-        return select_rows(crosswalk_path, exact_filters=exact_filters, in_filters=in_filters)
-    return pd.DataFrame()
+    if not is_cloud_mode() and not crosswalk_path.exists():
+        return pd.DataFrame()
+    return select_rows(crosswalk_path, exact_filters=exact_filters, in_filters=in_filters)
 
 
 def _shape_overlap(row: pd.Series, *, direction: str) -> dict[str, Any]:
@@ -268,3 +264,50 @@ def resolve_admin_to_family(
         "overlaps": overlaps,
         "overlap_count": len(overlaps),
     }
+
+
+def resolve_admin_ids_to_family(
+    target_loc_ids: list[str],
+    *,
+    source_family: str,
+    target_admin_level: int | str,
+    iso3: str = "USA",
+    crosswalk_path: Path | None = None,
+    min_target_area_share: float | None = None,
+    limit: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve many admin identities with one predicate-pushed crosswalk scan."""
+    ordered_ids = list(dict.fromkeys(str(value or "").strip() for value in target_loc_ids if str(value or "").strip()))
+    if not ordered_ids:
+        return {}
+    source_family = str(source_family or "").strip()
+    target_level = admin_level_name(target_admin_level)
+    path = crosswalk_path or default_crosswalk_path(
+        source_family=source_family,
+        target_admin_level=target_level,
+        iso3=iso3,
+    )
+    rows = _read_crosswalk_rows(path, in_filters={"target_loc_id": ordered_ids})
+    results: dict[str, dict[str, Any]] = {}
+    for target_loc_id in ordered_ids:
+        target_rows = rows[rows["target_loc_id"] == target_loc_id] if not rows.empty and "target_loc_id" in rows else pd.DataFrame()
+        target_rows = _filter_and_sort(
+            target_rows,
+            sort_col="target_area_share",
+            min_share=min_target_area_share,
+            limit=limit,
+        )
+        overlaps = [_shape_overlap(row, direction="admin_to_source") for _, row in target_rows.iterrows()]
+        results[target_loc_id] = {
+            "ok": bool(overlaps),
+            "direction": "admin_to_source",
+            "source_family": source_family,
+            "target_family": "admin",
+            "target_admin_level": target_level,
+            "target_loc_id": target_loc_id,
+            "crosswalk_path": str(path),
+            "primary_match": overlaps[0] if overlaps else None,
+            "overlaps": overlaps,
+            "overlap_count": len(overlaps),
+        }
+    return results

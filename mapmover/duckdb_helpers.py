@@ -33,6 +33,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 _MISSING_TIME_FILTER_WARNING_KEYS: set[tuple[str, tuple[str, ...]]] = set()
 _PARQUET_COLUMNS_CACHE: dict[str, tuple[tuple[int, int], set[str]]] = {}
+_PARQUET_CLOUD_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
 _PARQUET_COLUMNS_CACHE_LOCK = threading.Lock()
 
 
@@ -360,17 +361,10 @@ def reset_thread_connection_pool() -> int:
 
 
 def _make_connection():
-    """Backward-compatible accessor used by debug endpoints.
-
-    Returns the thread-local connection. Callers historically did
-    `con.close()` after use; that is now a no-op against the pool because
-    `close()` on a DuckDB connection only closes that handle, but the
-    pool returns the same handle on the next call. Debug endpoints that
-    used this pattern continue to work but no longer get isolation.
-    """
+    """Backward-compatible close-safe accessor used by debug endpoints."""
     if duckdb is None:
         return None
-    return _get_thread_connection()
+    return lease_query_connection()
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +384,51 @@ def _looks_like_connection_error(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return any(s in msg for s in ("broken pipe", "connection reset", "connection refused"))
+
+
+class _QueryConnectionLease:
+    """Close-compatible lease over the shared local/cloud query pools."""
+
+    def __init__(self, connection, generation: int | None) -> None:
+        self._connection = connection
+        self._generation = generation
+        self._discard = False
+        self._closed = False
+
+    def execute(self, *args, **kwargs):
+        try:
+            return self._connection.execute(*args, **kwargs)
+        except Exception as exc:
+            if _looks_like_connection_error(exc):
+                self._discard = True
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._generation is not None:
+            _release_query_connection(
+                self._connection, generation=self._generation, discard=self._discard,
+            )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, _traceback) -> None:
+        if exc is not None and _looks_like_connection_error(exc):
+            self._discard = True
+        self.close()
+
+
+def lease_query_connection() -> _QueryConnectionLease:
+    """Lease a configured connection for a multi-statement bounded query."""
+    if duckdb is None:
+        raise RuntimeError("DuckDB is unavailable")
+    if not is_cloud_mode():
+        return _QueryConnectionLease(_get_thread_connection(), None)
+    connection, generation = _acquire_query_connection()
+    return _QueryConnectionLease(connection, generation)
 
 
 def run_df(sql: str, params: list) -> pd.DataFrame:
@@ -461,13 +500,38 @@ def parquet_columns(parquet_path: Path) -> set[str]:
             cached = _PARQUET_COLUMNS_CACHE.get(cache_key)
             if cached and cached[0] == signature:
                 return set(cached[1])
+    else:
+        cache_key = "|".join((
+            os.environ.get("S3_BUCKET", ""),
+            os.environ.get("S3_PREFIX", ""),
+            os.environ.get("S3_PUBLISHED_PREFIX", ""),
+            str(parquet_path),
+        ))
+        try:
+            cache_seconds = max(1, int(os.environ.get("PARQUET_SCHEMA_CACHE_SECONDS", "300")))
+        except ValueError:
+            cache_seconds = 300
+        now = time.monotonic()
+        with _PARQUET_COLUMNS_CACHE_LOCK:
+            cached = _PARQUET_CLOUD_COLUMNS_CACHE.get(cache_key)
+            if cached and cached[0] > now:
+                return set(cached[1])
     uri = path_to_uri(parquet_path)
     rows = run_rows("DESCRIBE SELECT * FROM read_parquet(?)", [uri])
     columns = {row[0] for row in rows}
-    if not cloud_mode:
-        with _PARQUET_COLUMNS_CACHE_LOCK:
+    with _PARQUET_COLUMNS_CACHE_LOCK:
+        if not cloud_mode:
             _PARQUET_COLUMNS_CACHE[cache_key] = (signature, set(columns))
+        else:
+            _PARQUET_CLOUD_COLUMNS_CACHE[cache_key] = (now + cache_seconds, set(columns))
     return columns
+
+
+def clear_parquet_metadata_cache() -> None:
+    """Discard cached local signatures and cloud schemas after an activation change."""
+    with _PARQUET_COLUMNS_CACHE_LOCK:
+        _PARQUET_COLUMNS_CACHE.clear()
+        _PARQUET_CLOUD_COLUMNS_CACHE.clear()
 
 
 def quote_ident(name: str) -> str:
@@ -723,6 +787,19 @@ def select_rows(
     selected = [c for c in (columns or []) if c in available_cols]
     select_expr = ", ".join(quote_ident(c) for c in selected) if selected else "*"
 
+    requested_filter_columns = {
+        *(exact_filters or {}).keys(),
+        *(in_filters or {}).keys(),
+        *(starts_with_filters or {}).keys(),
+        *(column for column, _operator, _value in (compare_filters or [])),
+    }
+    missing_filter_columns = sorted(requested_filter_columns - available_cols)
+    if missing_filter_columns:
+        raise ValueError(
+            f"Parquet filter column(s) are absent from {parquet_path}: "
+            + ", ".join(missing_filter_columns)
+        )
+
     where: list[str] = []
     params: list = [uri]
 
@@ -733,10 +810,11 @@ def select_rows(
 
     for col, values in (in_filters or {}).items():
         values = [v for v in (values or []) if v is not None]
-        if col in available_cols and values:
-            placeholders = ", ".join("?" for _ in values)
-            where.append(f"{quote_ident(col)} IN ({placeholders})")
-            params.extend(values)
+        if not values:
+            return pd.DataFrame(columns=selected or list(available_cols))
+        placeholders = ", ".join("?" for _ in values)
+        where.append(f"{quote_ident(col)} IN ({placeholders})")
+        params.extend(values)
 
     for col, op, value in (compare_filters or []):
         if col not in available_cols or value is None:

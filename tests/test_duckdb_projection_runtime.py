@@ -2,6 +2,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 from mapmover import duckdb_helpers as helpers
 
 
@@ -39,6 +41,51 @@ class DuckdbProjectionRuntimeTests(unittest.TestCase):
         sql = run_df.call_args.args[0]
         self.assertIn('SELECT "name", "event_id", "timestamp"', sql)
         self.assertIn("LIMIT ?", sql)
+
+    def test_empty_in_filter_fails_closed_without_querying(self):
+        with patch.object(helpers, "duckdb", object()), \
+             patch.object(helpers, "parquet_available", return_value=True), \
+             patch.object(helpers, "path_to_uri", return_value="s3://bucket/geometry.parquet"), \
+             patch.object(helpers, "parquet_columns", return_value={"loc_id", "name"}), \
+             patch.object(helpers, "run_df") as run_df:
+            result = helpers.select_rows(
+                Path("geometry.parquet"),
+                columns=["loc_id", "name"],
+                in_filters={"loc_id": []},
+            )
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertTrue(result.empty)
+        run_df.assert_not_called()
+
+    def test_unknown_filter_column_is_an_explicit_error(self):
+        with patch.object(helpers, "duckdb", object()), \
+             patch.object(helpers, "parquet_available", return_value=True), \
+             patch.object(helpers, "path_to_uri", return_value="s3://bucket/geometry.parquet"), \
+             patch.object(helpers, "parquet_columns", return_value={"loc_id", "name"}), \
+             patch.object(helpers, "run_df") as run_df:
+            with self.assertRaisesRegex(ValueError, "missing_column"):
+                helpers.select_rows(
+                    Path("geometry.parquet"),
+                    exact_filters={"missing_column": "value"},
+                )
+
+        run_df.assert_not_called()
+
+    def test_cloud_schema_is_reused_without_resolving_artifact_twice(self):
+        helpers.clear_parquet_metadata_cache()
+        with patch.object(helpers, "duckdb", object()), \
+             patch.object(helpers, "is_cloud_mode", return_value=True), \
+             patch.object(helpers, "path_to_uri", return_value="s3://bucket/geometry.parquet") as uri, \
+             patch.object(helpers, "run_rows", return_value=[("loc_id",), ("name",)]) as run_rows:
+            first = helpers.parquet_columns(Path("geometry.parquet"))
+            second = helpers.parquet_columns(Path("geometry.parquet"))
+
+        self.assertEqual({"loc_id", "name"}, first)
+        self.assertEqual(first, second)
+        uri.assert_called_once()
+        run_rows.assert_called_once()
+        helpers.clear_parquet_metadata_cache()
 
 
 if __name__ == "__main__":

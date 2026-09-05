@@ -508,7 +508,7 @@ async def _authorize_paid_batch_tool(
     free_limit = _tool_batch_item_limit(tool_name)
     paid_limit = _tool_paid_batch_limit(tool_name, free_limit)
     trusted_token, _trusted_token_id = _trusted_artifact_access(request)
-    if item_count > paid_limit and trusted_token is None and not is_local_loopback_request(request):
+    if item_count > paid_limit and trusted_token is None:
         return None, _batch_error_payload(
             request_id=request_id,
             batch_id=None,
@@ -1142,7 +1142,7 @@ def get_server_description(pack_id: str | None = None) -> str:
             "For coordinates, call resolve_point with lat/lon or points; it returns only the compact complete latest-available chain and defaults to the deepest served tier. Do not request geometry or relationship detail in that call. "
             "When the caller asks for details about that chain, pass its stack loc_ids to loc_id_info; use get_geometry only for shapes and compare_geographies only for overlap, topology, validity, or successor questions. Mixed-vintage point context is not strict parentage. "
             "For a user dataset with unknown or informally declared geography keys, call identify_reference_system on representative or all distinct identifiers, then pass an unambiguous geography_binding to the conversion-job tools. For one known outside geography code or name, call resolve_reference. For bulk geometry, call resolve_loc_id_scope only for one strict hierarchy, then estimate_geometry_package before create_geometry_export. "
-            "Hosted geometry export and conversion creates are synchronous operations with operational safety limits (currently 250 selected geometries and 7,500 conversion rows by default) sized around a 10-20 second response budget. A direct loopback caller in RUNTIME_MODE=local has no service rate or item caps and is bounded only by its machine. Call the estimate tool or get_tool_help for the effective access lane. This facade does not promise a durable queue that is not deployed."
+            "Geometry export and conversion creates are synchronous operations with operational safety limits (currently 250 selected geometries and 7,500 conversion rows by default) sized around a 10-20 second response budget. Local and hosted tools use the same item ceilings for now; local access does not require hosted settlement. Call the estimate tool or get_tool_help for the effective access lane. This facade does not promise a durable queue that is not deployed."
         )
     if not normalized:
         return (
@@ -2016,7 +2016,7 @@ async def _execute_resolve_point_tool(request: Request, arguments: dict[str, Any
                 metadata={"event": "point_lookup", "tool_mode": "bulk", "quantity": len(points), "batch_id": batch_id},
             )
             return _jsonrpc_response(_tool_result(error_payload, is_error=True), rpc_request_id)
-        if len(points) > paid_limit and trusted_token is None and not is_local_loopback_request(request):
+        if len(points) > paid_limit and trusted_token is None:
             _stamp_mcp_tool_analytics(
                 request,
                 event="mcp_tool",
@@ -2519,7 +2519,7 @@ async def _execute_loc_id_info_tool(request: Request, arguments: dict[str, Any],
                 _parse_env_int_optional("MCP_TOOL_REFERENCES_BATCH_LIMIT_LOC_ID_INFO")
                 or int(tool_sub_limit("loc_id_info", "references").get("free_item_limit") or 25)
             )
-            if len(loc_ids) > references_limit and trusted_token is None and not is_local_loopback_request(request):
+            if len(loc_ids) > references_limit and trusted_token is None:
                 error_payload = _batch_error_payload(
                     request_id=request_id,
                     batch_id=batch_id,
@@ -2550,7 +2550,7 @@ async def _execute_loc_id_info_tool(request: Request, arguments: dict[str, Any],
                     },
                 )
                 return _jsonrpc_response(_tool_result(error_payload, is_error=True), rpc_request_id)
-        if len(loc_ids) > limit and trusted_token is None and not is_local_loopback_request(request):
+        if len(loc_ids) > limit and trusted_token is None:
             error_payload = _batch_error_payload(
                 request_id=request_id,
                 batch_id=batch_id,
@@ -2579,7 +2579,9 @@ async def _execute_loc_id_info_tool(request: Request, arguments: dict[str, Any],
         runtime_started = time.perf_counter()
         results = await run_mcp_blocking(
             "loc_id_info",
-            lambda: [_loc_id_info_item(loc_id, payload) for loc_id in loc_ids],
+            _loc_id_info_items,
+            loc_ids,
+            payload,
         )
         stages = {"metadata_fetch_ms": _elapsed_ms(runtime_started)}
         result_payload = {
@@ -2694,19 +2696,90 @@ async def _execute_loc_id_info_tool(request: Request, arguments: dict[str, Any],
     return _jsonrpc_response(_tool_result(result), rpc_request_id)
 
 
-def _loc_id_info_item(loc_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    requested_loc_id = str(loc_id or "").strip().upper()
-    try:
-        from mapmover.runtime.reference_exchange import resolve_loc_id_input
+def _loc_id_info_items(loc_ids: list[str], payload: dict[str, Any]) -> list[dict[str, Any]]:
+    from mapmover.geometry_handlers import get_location_infos
+    from mapmover.runtime.reference_exchange import resolve_loc_id_input
 
-        public_resolution = resolve_loc_id_input(requested_loc_id)
-    except Exception:
-        public_resolution = {
-            "ok": True,
-            "requested_loc_id": requested_loc_id,
-            "loc_id": requested_loc_id,
-            "resolved_from_public_alias": False,
-        }
+    requested = [str(loc_id or "").strip().upper() for loc_id in loc_ids]
+    unique_requested = list(dict.fromkeys(requested))
+    direct_infos = get_location_infos(
+        unique_requested,
+        include_memberships=False,
+        fallback=False,
+    )
+    direct_info_by_loc_id = {
+        loc_id: info
+        for loc_id, info in zip(unique_requested, direct_infos)
+        if isinstance(info, dict) and not info.get("error")
+    }
+    resolutions: dict[str, dict[str, Any]] = {}
+    for loc_id in unique_requested:
+        if loc_id in direct_info_by_loc_id:
+            resolutions[loc_id] = {
+                "ok": True,
+                "status": "unchanged",
+                "requested_loc_id": loc_id,
+                "loc_id": loc_id,
+                "resolved_from_public_alias": False,
+            }
+            continue
+        try:
+            resolutions[loc_id] = resolve_loc_id_input(loc_id)
+        except Exception:
+            resolutions[loc_id] = {
+                "ok": True,
+                "requested_loc_id": loc_id,
+                "loc_id": loc_id,
+                "resolved_from_public_alias": False,
+            }
+    canonical_ids = list(dict.fromkeys(
+        str(resolution.get("loc_id") or requested_id)
+        for requested_id, resolution in resolutions.items()
+        if resolution.get("ok")
+    ))
+    missing_canonical_ids = [
+        canonical_id for canonical_id in canonical_ids
+        if canonical_id not in direct_info_by_loc_id
+    ]
+    fallback_infos = get_location_infos(
+        missing_canonical_ids,
+        include_memberships=False,
+    ) if missing_canonical_ids else []
+    info_by_loc_id = dict(direct_info_by_loc_id)
+    info_by_loc_id.update(zip(missing_canonical_ids, fallback_infos))
+    return [
+        _loc_id_info_item(
+            loc_id,
+            payload,
+            public_resolution=resolutions[loc_id],
+            preloaded_info=info_by_loc_id.get(str(resolutions[loc_id].get("loc_id") or loc_id)),
+            use_preloaded=True,
+        )
+        for loc_id in requested
+    ]
+
+
+def _loc_id_info_item(
+    loc_id: str,
+    payload: dict[str, Any],
+    *,
+    public_resolution: dict[str, Any] | None = None,
+    preloaded_info: dict[str, Any] | None = None,
+    use_preloaded: bool = False,
+) -> dict[str, Any]:
+    requested_loc_id = str(loc_id or "").strip().upper()
+    if public_resolution is None:
+        try:
+            from mapmover.runtime.reference_exchange import resolve_loc_id_input
+
+            public_resolution = resolve_loc_id_input(requested_loc_id)
+        except Exception:
+            public_resolution = {
+                "ok": True,
+                "requested_loc_id": requested_loc_id,
+                "loc_id": requested_loc_id,
+                "resolved_from_public_alias": False,
+            }
     if not public_resolution.get("ok"):
         result = {
             "loc_id": requested_loc_id,
@@ -2721,15 +2794,18 @@ def _loc_id_info_item(loc_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             result["candidate_loc_ids"] = public_resolution.get("candidate_loc_ids")
         return result
     canonical_loc_id = str(public_resolution.get("loc_id") or requested_loc_id)
-    try:
-        from mapmover.geometry_handlers import get_location_info
+    from mapmover.geometry_handlers import get_location_info
 
-        # MCP returns hierarchy only when explicitly requested and never exposes
-        # popup memberships. Avoid a second ancestor-metadata read whose result
-        # would otherwise be discarded from the response.
-        info = get_location_info(canonical_loc_id, include_memberships=False)
-    except Exception as exc:
-        return {"loc_id": canonical_loc_id, "error": {"code": "info_failed", "message": str(exc)}}
+    if use_preloaded:
+        info = preloaded_info
+    else:
+        try:
+            # MCP returns hierarchy only when explicitly requested and never exposes
+            # popup memberships. Avoid a second ancestor-metadata read whose result
+            # would otherwise be discarded from the response.
+            info = get_location_info(canonical_loc_id, include_memberships=False)
+        except Exception as exc:
+            return {"loc_id": canonical_loc_id, "error": {"code": "info_failed", "message": str(exc)}}
     if not isinstance(info, dict) or info.get("error"):
         return {
             "loc_id": canonical_loc_id,
@@ -2925,7 +3001,7 @@ async def _execute_identify_reference_system_tool(request: Request, arguments: d
         identifiers = []
     limit = _tool_batch_item_limit("identify_reference_system")
     trusted_token, _trusted_token_id = _trusted_artifact_access(request)
-    if len(identifiers) > limit and trusted_token is None and not is_local_loopback_request(request):
+    if len(identifiers) > limit and trusted_token is None:
         error_payload = _batch_error_payload(
             request_id=request_id,
             batch_id=None,
@@ -3489,45 +3565,116 @@ def _compare_geographies_item(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_reference_items(items: list[Any], base_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+    from mapmover.runtime.reference_exchange import resolve_references_batch
+
+    results: list[dict[str, Any] | None] = []
+    requests: list[dict[str, Any]] = []
+    valid_indexes: list[int] = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             results.append({"row_index": index, "ok": False, "error": {"code": "invalid_item", "message": "each item must be an object"}})
             continue
-        result = _resolve_reference_item({**base_payload, **item})
+        merged = {**base_payload, **item}
+        from_system = str(merged.get("from_system") or merged.get("system") or "").strip()
+        value = str(merged.get("value") or "").strip()
+        if not from_system or not value:
+            result = {"ok": False, "error": {"code": "invalid_reference_request", "message": "from_system and value are required"}}
+            if item.get("row_index") is not None:
+                result["row_index"] = item.get("row_index")
+            elif item.get("id") is not None:
+                result["id"] = item.get("id")
+            results.append(result)
+            continue
+        valid_indexes.append(index)
+        requests.append({
+            "from_system": from_system,
+            "value": value,
+            "iso3": str(merged.get("iso3") or "USA"),
+            "target_admin_level": merged.get("target_admin_level", "admin_2"),
+            "relationship_vintage": merged.get("relationship_vintage"),
+            "min_share": _normalize_crosswalk_share(merged.get("min_share")),
+            "limit": _normalize_crosswalk_limit(merged.get("limit")) or 10,
+            "country_hint": merged.get("country_hint"),
+            "admin_level_hint": merged.get("admin_level_hint"),
+            "as_of": merged.get("as_of"),
+        })
+        results.append(None)
+    batch_results = resolve_references_batch(requests)
+    for index, result in zip(valid_indexes, batch_results):
+        item = items[index]
         if item.get("row_index") is not None:
             result["row_index"] = item.get("row_index")
         elif item.get("id") is not None:
             result["id"] = item.get("id")
-        results.append(result)
-    return results
+        results[index] = result
+    return [result for result in results if result is not None]
 
 
 def _convert_reference_items(items: list[Any], base_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+    from mapmover.runtime.reference_exchange import convert_references_batch
+
+    results: list[dict[str, Any] | None] = []
+    requests: list[dict[str, Any]] = []
+    valid_indexes: list[int] = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             results.append({"row_index": index, "ok": False, "error": {"code": "invalid_item", "message": "each item must be an object"}})
             continue
-        result = _convert_reference_item({**base_payload, **item})
+        merged = {**base_payload, **item}
+        from_system = str(merged.get("from_system") or "").strip()
+        to_system = str(merged.get("to_system") or "").strip()
+        value = str(merged.get("value") or "").strip()
+        if not from_system or not to_system or not value:
+            result = {"ok": False, "error": {"code": "invalid_convert_request", "message": "from_system, value, and to_system are required"}}
+            if item.get("row_index") is not None:
+                result["row_index"] = item.get("row_index")
+            elif item.get("id") is not None:
+                result["id"] = item.get("id")
+            results.append(result)
+            continue
+        valid_indexes.append(index)
+        requests.append({
+            "from_system": from_system,
+            "value": value,
+            "to_system": to_system,
+            "iso3": str(merged.get("iso3") or "USA"),
+            "target_admin_level": merged.get("target_admin_level", "admin_2"),
+            "relationship_vintage": merged.get("relationship_vintage"),
+            "min_share": _normalize_crosswalk_share(merged.get("min_share")),
+            "limit": _normalize_crosswalk_limit(merged.get("limit")) or 10,
+        })
+        results.append(None)
+    batch_results = convert_references_batch(requests)
+    for index, result in zip(valid_indexes, batch_results):
+        item = items[index]
         if item.get("row_index") is not None:
             result["row_index"] = item.get("row_index")
         elif item.get("id") is not None:
             result["id"] = item.get("id")
-        results.append(result)
-    return results
+        results[index] = result
+    return [result for result in results if result is not None]
 
 
 def _compare_geographies_items(items: list[Any], base_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+    from mapmover.runtime.geography_relationships import compare_geographies_batch
+
+    results: list[dict[str, Any] | None] = []
+    valid_payloads: list[dict[str, Any]] = []
+    valid_indexes: list[int] = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             results.append({"row_index": index, "ok": False, "error": {"code": "invalid_item", "message": "each item must be an object"}})
             continue
-        result = dict(_compare_geographies_item({**base_payload, **item}))
-        result["row_index"] = item.get("row_index", item.get("id", index))
-        results.append(result)
-    return results
+        valid_indexes.append(index)
+        valid_payloads.append({**base_payload, **item})
+        results.append(None)
+    batch_results = compare_geographies_batch(valid_payloads)
+    for index, result in zip(valid_indexes, batch_results):
+        item = items[index]
+        shaped = dict(result)
+        shaped["row_index"] = item.get("row_index", item.get("id", index))
+        results[index] = shaped
+    return [result for result in results if result is not None]
 
 
 @_guard_mcp_execution("compare_geographies")
@@ -3543,7 +3690,7 @@ async def _execute_compare_geographies_tool(request: Request, arguments: dict[st
             return _jsonrpc_response(_tool_result(result_payload, is_error=True), rpc_request_id)
         limit = _tool_batch_item_limit("compare_geographies")
         trusted_token, trusted_token_id = _trusted_artifact_access(request)
-        if len(items) > limit and trusted_token is None and not is_local_loopback_request(request):
+        if len(items) > limit and trusted_token is None:
             result_payload = _batch_error_payload(
                 request_id=request_id,
                 batch_id=batch_id,
@@ -3662,7 +3809,7 @@ async def _execute_get_geometry_tool(request: Request, arguments: dict[str, Any]
             else None
         ) or _tool_batch_item_limit("get_geometry")
         trusted_token, trusted_token_id = _trusted_artifact_access(request)
-        if len(loc_ids) > limit and trusted_token is None and not is_local_loopback_request(request):
+        if len(loc_ids) > limit and trusted_token is None:
             error_payload = _batch_error_payload(
                 request_id=request_id,
                 batch_id=batch_id,
@@ -3968,75 +4115,99 @@ async def _execute_geometry_job_runtime_tool(request: Request, arguments: dict[s
     payload = _ensure_request_id(arguments, tool_name)
     request_id = str(payload.get("request_id") or "")
     trusted_token, trusted_token_id = _trusted_artifact_access(request)
-    local_unrestricted = is_local_loopback_request(request)
+    local_request = is_local_loopback_request(request)
     commercial_context: dict[str, Any] | None = None
     try:
         from mapmover.runtime import geometry_tool_jobs
 
         runtime_started = time.perf_counter()
         if tool_name == "resolve_loc_id_scope":
-            limit = None if local_unrestricted else _tool_batch_item_limit("resolve_loc_id_scope")
-            if trusted_token is not None and not local_unrestricted:
+            limit = _tool_batch_item_limit("resolve_loc_id_scope")
+            if trusted_token is not None:
                 limit = (
                     _parse_env_int_optional("MCP_TOOL_TRUSTED_BATCH_LIMIT_RESOLVE_LOC_ID_SCOPE")
                     or int(tool_profile("resolve_loc_id_scope").get("trusted_item_limit") or 100000)
                 )
-            result = geometry_tool_jobs.resolve_loc_id_scope(payload, default_limit=limit)
+            result = await run_mcp_blocking(
+                tool_name, geometry_tool_jobs.resolve_loc_id_scope,
+                payload, default_limit=limit,
+            )
             capability_id = "loc_id_scope"
         elif tool_name == "estimate_geometry_package":
-            result = geometry_tool_jobs.estimate_geometry_package(
-                payload,
-                execution_limit=None if local_unrestricted else _tool_batch_item_limit("create_geometry_export"),
+            result = await run_mcp_blocking(
+                tool_name, geometry_tool_jobs.estimate_geometry_package,
+                payload, execution_limit=_tool_batch_item_limit("create_geometry_export"),
             )
             capability_id = "geometry_package_estimate"
         elif tool_name == "create_geometry_export":
-            inline_limit = None if local_unrestricted else _tool_batch_item_limit("create_geometry_export")
+            inline_limit = _tool_batch_item_limit("create_geometry_export")
             capability_id = "geometry_export"
             hosted_commercial = (
                 commercial_access_enabled()
-                and not local_unrestricted
+                and not local_request
                 and trusted_token is None
                 and _tool_paid_bulk_enforced(tool_name)
             )
             if hosted_commercial:
-                estimate = geometry_tool_jobs.estimate_geometry_package(payload, execution_limit=inline_limit)
+                estimate = await run_mcp_blocking(
+                    tool_name, geometry_tool_jobs.estimate_geometry_package,
+                    payload, execution_limit=inline_limit,
+                )
                 if not estimate.get("ok"):
                     result = estimate
                 else:
                     commercial_context, denial = await _authorize_geometry_job_execution(
                         request, tool_name=tool_name, payload=payload, estimate=estimate
                     )
-                    result = denial or geometry_tool_jobs.create_geometry_export(payload, inline_limit=inline_limit)
+                    result = denial or await run_mcp_blocking(
+                        tool_name, geometry_tool_jobs.create_geometry_export,
+                        payload, inline_limit=inline_limit,
+                    )
             else:
-                result = geometry_tool_jobs.create_geometry_export(payload, inline_limit=inline_limit)
+                result = await run_mcp_blocking(
+                    tool_name, geometry_tool_jobs.create_geometry_export,
+                    payload, inline_limit=inline_limit,
+                )
         elif tool_name == "estimate_conversion_job":
-            result = geometry_tool_jobs.estimate_conversion_job(
-                payload,
-                execution_limit=None if local_unrestricted else _tool_batch_item_limit("create_conversion_job"),
+            result = await run_mcp_blocking(
+                tool_name, geometry_tool_jobs.estimate_conversion_job,
+                payload, execution_limit=_tool_batch_item_limit("create_conversion_job"),
             )
             capability_id = "conversion_job_estimate"
         elif tool_name == "create_conversion_job":
-            inline_limit = None if local_unrestricted else _tool_batch_item_limit("create_conversion_job")
+            inline_limit = _tool_batch_item_limit("create_conversion_job")
             capability_id = "conversion_job"
             hosted_commercial = (
                 commercial_access_enabled()
-                and not local_unrestricted
+                and not local_request
                 and trusted_token is None
                 and _tool_paid_bulk_enforced(tool_name)
             )
             if hosted_commercial:
-                estimate = geometry_tool_jobs.estimate_conversion_job(payload, execution_limit=inline_limit)
+                estimate = await run_mcp_blocking(
+                    tool_name, geometry_tool_jobs.estimate_conversion_job,
+                    payload, execution_limit=inline_limit,
+                )
                 if not estimate.get("ok"):
                     result = estimate
                 else:
                     commercial_context, denial = await _authorize_geometry_job_execution(
                         request, tool_name=tool_name, payload=payload, estimate=estimate
                     )
-                    result = denial or geometry_tool_jobs.create_conversion_job(payload, inline_limit=inline_limit)
+                    result = denial or await run_mcp_blocking(
+                        tool_name, geometry_tool_jobs.create_conversion_job,
+                        payload, inline_limit=inline_limit,
+                    )
             else:
-                result = geometry_tool_jobs.create_conversion_job(payload, inline_limit=inline_limit)
+                result = await run_mcp_blocking(
+                    tool_name, geometry_tool_jobs.create_conversion_job,
+                    payload, inline_limit=inline_limit,
+                )
         elif tool_name == "get_job_status":
-            result = geometry_tool_jobs.get_job_status(str(payload.get("job_id") or ""))
+            result = await run_mcp_blocking(
+                tool_name, geometry_tool_jobs.get_job_status,
+                str(payload.get("job_id") or ""),
+            )
             capability_id = "geometry_job_status"
         else:
             return _jsonrpc_error(rpc_request_id, -32601, f"Tool '{tool_name}' not found")
@@ -4144,7 +4315,7 @@ async def _execute_check_geometry_tool(request: Request, arguments: dict[str, An
             return _jsonrpc_response(_tool_result(error_payload, is_error=True), rpc_request_id)
         limit = _tool_batch_item_limit("check_geometry")
         trusted_token, trusted_token_id = _trusted_artifact_access(request)
-        if len(loc_ids) > limit and trusted_token is None and not is_local_loopback_request(request):
+        if len(loc_ids) > limit and trusted_token is None:
             _stamp_mcp_tool_analytics(
                 request,
                 event="mcp_tool",
@@ -4736,7 +4907,7 @@ async def mcp_endpoint(request: Request, pack_id: str | None = None):
             tool_definition=target_definition,
             available_on_facades=_tool_facade_urls(target_name),
             effective_limits=effective_limits,
-            local_unrestricted=is_local_loopback_request(request),
+            local_installed=is_local_loopback_request(request),
         )
         return _finish_data_helper(
             request,

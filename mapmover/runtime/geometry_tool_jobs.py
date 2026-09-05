@@ -23,6 +23,7 @@ from typing import Any
 
 from ..geometry_handlers import GEOMETRY_INDEX_COLUMNS, get_geometry_index, load_country_parquet
 from .admin_hierarchy import infer_admin_level_from_loc_id
+from .admin_spine_query import query_descendant_scope
 from .country_geography import get_country_supported_deep_admin_levels
 from .geography_reference import translate_geometry_id_to_local_id
 from .reference_exchange import (
@@ -195,7 +196,7 @@ def _base_admin_scope_rows(parent_loc_id: str, admin_level: int, bbox: tuple[flo
 
 
 def _unsupported_deep_scope_error(parent_loc_id: str, admin_level: int, bbox: tuple[float, float, float, float] | None) -> dict[str, Any] | None:
-    if admin_level < 3:
+    if admin_level <= 3:
         return None
     iso3 = _country_code_from_loc_id(parent_loc_id)
     supported_levels = get_country_supported_deep_admin_levels(iso3)
@@ -219,14 +220,14 @@ def _unsupported_deep_scope_error(parent_loc_id: str, admin_level: int, bbox: tu
             "error": {"code": "invalid_scope", "message": "parent_loc_id is not a recognized admin loc_id shape"},
             "supported_deep_admin_levels": [f"admin_{level}" for level in supported_levels],
         }
-    if parent_level < 2 and bbox is None:
+    if parent_level < 1:
         return {
             "ok": False,
             "parent_loc_id": parent_loc_id,
             "admin_level": admin_level,
             "error": {
                 "code": "scope_too_broad",
-                "message": "Deep admin scope requests require an admin_2 parent or bbox; use estimate/create export for country- or state-scale deep geometry.",
+                "message": "Country-wide deep scope spans multiple Admin1 banks; choose an admin_1 parent so the query can stay on one Parquet file.",
             },
             "supported_deep_admin_levels": [f"admin_{level}" for level in supported_levels],
         }
@@ -258,39 +259,18 @@ def _row_summary(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _scope_rows(parent_loc_id: str, admin_level: int, bbox: tuple[float, float, float, float] | None) -> list[dict[str, Any]]:
+    """Compatibility scope reader for holdings without an Admin Spine layout.
+
+    This intentionally performs at most one index query and one legacy base
+    query. The former parent-by-parent frontier expansion multiplied Parquet
+    opens at every level and is not a safe runtime fallback.
+    """
     index = get_geometry_index(parent_loc_id=parent_loc_id, admin_level=admin_level, bbox=bbox)
     rows = [row for row in (index.get("rows") or []) if isinstance(row, dict)]
     if rows:
         return rows
 
-    parent_level = infer_admin_level_from_loc_id(parent_loc_id)
-    if parent_level is None or admin_level <= parent_level + 1:
-        return _base_admin_scope_rows(parent_loc_id, admin_level, bbox) or rows
-    base_rows = _base_admin_scope_rows(parent_loc_id, admin_level, bbox)
-    if base_rows:
-        return base_rows
-
-    frontier = [parent_loc_id]
-    for level in range(parent_level + 1, admin_level + 1):
-        level_rows: list[dict[str, Any]] = []
-        next_frontier: list[str] = []
-        for current_parent in frontier:
-            child_index = get_geometry_index(parent_loc_id=current_parent, admin_level=level, bbox=bbox)
-            child_rows = [row for row in (child_index.get("rows") or []) if isinstance(row, dict)]
-            if level == admin_level:
-                level_rows.extend(child_rows)
-            else:
-                next_frontier.extend(
-                    translate_geometry_id_to_local_id(str(row.get("loc_id") or "").strip())
-                    for row in child_rows
-                    if row.get("loc_id")
-                )
-        if level == admin_level:
-            return level_rows
-        frontier = next_frontier
-        if not frontier:
-            break
-    return []
+    return _base_admin_scope_rows(parent_loc_id, admin_level, bbox) or rows
 
 
 def resolve_loc_id_scope(payload: dict[str, Any], *, default_limit: int | None = 100) -> dict[str, Any]:
@@ -312,18 +292,31 @@ def resolve_loc_id_scope(payload: dict[str, Any], *, default_limit: int | None =
     if admin_level is None:
         return {"ok": False, "error": {"code": "invalid_scope", "message": "admin_level is required"}}
     bbox = _bbox_value(scope.get("bbox") if isinstance(scope, dict) else payload.get("bbox"))
-    unsupported = _unsupported_deep_scope_error(parent_loc_id, admin_level, bbox)
-    if unsupported:
-        return _clean_json(unsupported)
     requested_limit = payload.get("limit")
     limit = max(0, int(requested_limit)) if requested_limit is not None else (
         max(0, int(default_limit)) if default_limit is not None else None
     )
     offset = max(0, int(payload.get("offset") or 0))
     count_only = bool(payload.get("count_only"))
-    rows = [_row_summary(row) for row in _scope_rows(parent_loc_id, admin_level, bbox)]
-    total = len(rows)
-    page = [] if count_only else (rows[offset:] if limit is None else rows[offset : offset + limit])
+    unsupported = _unsupported_deep_scope_error(parent_loc_id, admin_level, bbox)
+    if unsupported:
+        return _clean_json(unsupported)
+    direct = query_descendant_scope(
+        _country_code_from_loc_id(parent_loc_id),
+        parent_loc_id,
+        admin_level,
+        bbox=bbox,
+        limit=limit,
+        offset=offset,
+        count_only=count_only,
+    )
+    if direct is not None:
+        total = int(direct.get("total_count") or 0)
+        page = [_row_summary(row) for row in direct.get("rows") or []]
+    else:
+        rows = [_row_summary(row) for row in _scope_rows(parent_loc_id, admin_level, bbox)]
+        total = len(rows)
+        page = [] if count_only else (rows[offset:] if limit is None else rows[offset : offset + limit])
     result = {
             "ok": True,
             "parent_loc_id": parent_loc_id,

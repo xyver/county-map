@@ -3,11 +3,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import pandas as pd
+
 import mapmover.runtime.marine_geometry as marine_runtime
 from mapmover.runtime.reference_exchange import _geometry_catalog_domains
 from mapmover.runtime.marine_geometry import (
-    EEZ_PATH,
-    WATER_BODIES_PATH,
     has_marine_geometry,
     is_marine_loc_id,
     load_marine_geometry,
@@ -104,32 +104,106 @@ class MarineGeometryRuntimeTests(unittest.TestCase):
         self.assertFalse(is_marine_loc_id(""))
 
     def test_bank_routing(self):
-        self.assertEqual(marine_bank_for_loc_id("EEZ-USA"), EEZ_PATH)
-        self.assertEqual(marine_bank_for_loc_id("EEZ-ASM"), EEZ_PATH)
-        active = marine_runtime._active_domain_paths()
-        expected_water_bodies = active["water_bodies"] if active else WATER_BODIES_PATH
-        self.assertEqual(marine_bank_for_loc_id("XOP"), expected_water_bodies)
-        self.assertEqual(marine_bank_for_loc_id("XLM"), expected_water_bodies)
-        self.assertIsNone(marine_bank_for_loc_id("USA"))
+        active = {
+            "jurisdictions": Path("marine/jurisdictions.parquet"),
+            "water_bodies": Path("marine/water_bodies.parquet"),
+            "named_water_areas": Path("marine/named_water_areas.parquet"),
+            "country_components": {"USA": Path("marine/country_components/USA.parquet")},
+        }
+        with patch.object(marine_runtime, "_active_domain_paths", return_value=active):
+            self.assertIsNone(marine_bank_for_loc_id("EEZ-USA"))
+            self.assertEqual(
+                marine_bank_for_loc_id("USA-CZ-MRGID-49390"),
+                active["country_components"]["USA"],
+            )
+            self.assertEqual(marine_bank_for_loc_id("XOP-CZ-MRGID-48975"), active["jurisdictions"])
+            self.assertEqual(marine_bank_for_loc_id("XOP"), active["water_bodies"])
+            self.assertEqual(marine_bank_for_loc_id("XLM"), active["water_bodies"])
+            self.assertIsNone(marine_bank_for_loc_id("USA"))
+
+    def test_bank_routing_fails_closed_without_catalog_domain(self):
+        with patch.object(marine_runtime, "_active_domain_paths", return_value=None):
+            self.assertIsNone(marine_bank_for_loc_id("USA-CZ-MRGID-49390"))
+            self.assertIsNone(marine_bank_for_loc_id("XOP"))
 
     def test_resolve_source(self):
-        self.assertEqual(resolve_marine_geometry_source("EEZ-USA")["marine_kind"], "marine_eez")
-        self.assertEqual(resolve_marine_geometry_source("XSG")["marine_kind"], "water_body")
-        self.assertIsNone(resolve_marine_geometry_source("USA")["parquet_file"])
+        active = {
+            "jurisdictions": Path("marine/jurisdictions.parquet"),
+            "water_bodies": Path("marine/water_bodies.parquet"),
+            "named_water_areas": Path("marine/named_water_areas.parquet"),
+            "country_components": {"USA": Path("marine/country_components/USA.parquet")},
+        }
+        with patch.object(marine_runtime, "_active_domain_paths", return_value=active), patch.object(
+            marine_runtime, "parquet_available", return_value=True,
+        ):
+            self.assertEqual(
+                resolve_marine_geometry_source("USA-CZ-MRGID-49390")["marine_kind"],
+                "marine_jurisdiction",
+            )
+            self.assertEqual(resolve_marine_geometry_source("XSG")["marine_kind"], "water_body")
+            self.assertIsNone(resolve_marine_geometry_source("USA")["parquet_file"])
+
+    def test_exact_empty_result_does_not_trigger_full_bank_read(self):
+        with patch.object(marine_runtime, "parquet_available", return_value=True), patch.object(
+            marine_runtime, "read_rows_by_ids", return_value=marine_runtime.pd.DataFrame(),
+        ) as exact_read, patch.object(
+            marine_runtime, "select_columns_from_parquet",
+            side_effect=AssertionError("exact miss must not become a full-bank scan"),
+        ):
+            result = marine_runtime._read_bank(Path("marine.parquet"), {"XOP"})
+        self.assertTrue(result.empty)
+        exact_read.assert_called_once()
+
+    def test_batch_water_candidates_are_not_reopened_for_shape_hydration(self):
+        domain = {
+            "bbox_index": Path("marine/bbox.parquet"),
+            "point_shards": {},
+            "water_bodies": Path("marine/water.parquet"),
+            "named_water_areas": Path("marine/named.parquet"),
+        }
+
+        def candidates(path, _points, *, columns):
+            if path == domain["water_bodies"]:
+                return pd.DataFrame([{
+                    "point_position": 0,
+                    "loc_id": "XOP",
+                    "name": "Pacific Ocean",
+                    "geometry": "{}",
+                    "centroid_lon": 0.0,
+                    "centroid_lat": 0.0,
+                    "bbox_min_lon": -180.0,
+                    "bbox_min_lat": -90.0,
+                    "bbox_max_lon": 180.0,
+                    "bbox_max_lat": 90.0,
+                }])
+            return pd.DataFrame(columns=["point_position", *columns])
+
+        with patch.object(marine_runtime, "_active_domain_paths", return_value=domain), patch.object(
+            marine_runtime, "read_bbox_candidates_for_points", side_effect=candidates,
+        ), patch.object(
+            marine_runtime, "read_rows_by_ids",
+            side_effect=AssertionError("water candidate bank must only be scanned once"),
+        ):
+            frame, candidates_by_point = marine_runtime.load_marine_geometry_for_points([
+                {"lon": -120.0, "lat": 30.0},
+            ])
+
+        self.assertEqual(set(frame["loc_id"]), {"XOP"})
+        self.assertEqual(candidates_by_point, {0: ["XOP"]})
 
     @unittest.skipUnless(has_marine_geometry(), "marine geometry banks not present locally")
     def test_load_geometry_for_loc_ids(self):
-        df = load_marine_geometry(["EEZ-USA", "XSG", "XLG", "XLS", "XLM", "XLH", "XLE", "XLO"])
+        df = load_marine_geometry(["USA-CZ-MRGID-49390", "XSG", "XLG", "XLS", "XLM", "XLH", "XLE", "XLO"])
         ids = set(df["loc_id"])
-        self.assertIn("EEZ-USA", ids)
+        self.assertIn("USA-CZ-MRGID-49390", ids)
         self.assertIn("XSG", ids)
         self.assertTrue({"XLG", "XLS", "XLM", "XLH", "XLE", "XLO"}.issubset(ids))
         self.assertTrue((df["geometry"].astype(str).str.len() > 0).all())
 
     @unittest.skipUnless(has_marine_geometry(), "marine geometry banks not present locally")
-    def test_eez_only_query_skips_water_body_bank(self):
-        df = load_marine_geometry(["EEZ-USA"])
-        self.assertEqual(set(df["loc_id"]), {"EEZ-USA"})
+    def test_jurisdiction_only_query_skips_water_body_bank(self):
+        df = load_marine_geometry(["USA-CZ-MRGID-49390"])
+        self.assertEqual(set(df["loc_id"]), {"USA-CZ-MRGID-49390"})
 
 
 if __name__ == "__main__":
