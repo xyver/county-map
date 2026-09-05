@@ -21,9 +21,8 @@ not specific to one pack.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import pandas as pd
 
@@ -41,15 +40,13 @@ from .geography_reference import (
     is_named_water_loc_id,
     is_water_body_loc_id,
 )
+from .geometry_catalog import load_geometry_catalog
 
 MARINE_DIR = GEOMETRY_DIR / "marine"
 EEZ_PATH = MARINE_DIR / "eez.parquet"
 WATER_BODIES_PATH = MARINE_DIR / "water_bodies.parquet"
 IHO1953_NAMED_WATER_PATH = MARINE_DIR / "iho1953_sea_areas.parquet"
 GEOMETRY_CATALOG_PATH = GEOMETRY_DIR / "geometry_catalog.json"
-MARINE_DOMAIN_RELEASES_DIR = GEOMETRY_DIR / "domains" / "MARINE" / "releases" / "geometry"
-MARINE_DOMAIN_POINTER = MARINE_DOMAIN_RELEASES_DIR / "current.json"
-
 _MARINE_COLUMNS = ["loc_id", "name", "geometry", "centroid_lon", "centroid_lat"]
 _MARINE_POINT_COLUMNS = _MARINE_COLUMNS + [
     "bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat",
@@ -88,38 +85,46 @@ def named_water_bank_approved(loc_id: str | None = None) -> bool:
     return _catalog_approves_geometry(IHO1953_NAMED_WATER_PATH)
 
 
-def _active_domain_root() -> Optional[Path]:
-    """Return only an explicitly admitted immutable Marine release root."""
+def _catalog_artifact_path(record: Any) -> Optional[Path]:
+    relative = str(record.get("path") or "").strip() if isinstance(record, dict) else ""
+    if not relative:
+        return None
+    path = GEOMETRY_DIR.parent / relative
     try:
-        pointer = json.loads(MARINE_DOMAIN_POINTER.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if pointer.get("release_unit_id") != "MARINE":
-        return None
-    if pointer.get("publication_status") not in {
-        "adopted_local_unpublished", "approved_for_publication", "published",
-    }:
-        return None
-    version_path = GEOMETRY_DIR.parent / str(pointer.get("version_path") or "")
-    try:
-        release_root = version_path.resolve().parent
-        release_root.relative_to(MARINE_DOMAIN_RELEASES_DIR.resolve())
+        path.resolve().relative_to(GEOMETRY_DIR.parent.resolve())
     except (OSError, ValueError):
         return None
-    return release_root if version_path.is_file() else None
+    return path
 
 
-def _active_domain_paths() -> Optional[dict[str, Path]]:
-    root = _active_domain_root()
-    if root is None:
+def _active_domain_paths() -> Optional[dict[str, Any]]:
+    """Resolve the active Marine banks only from the canonical runtime catalog."""
+    catalog = load_geometry_catalog()
+    profile = next((
+        item for item in catalog.get("domain_profiles") or []
+        if isinstance(item, dict)
+        and str(item.get("release_unit_id") or "").strip().upper() == "MARINE"
+    ), None)
+    active = profile.get("active_release") if isinstance(profile, dict) else None
+    if not isinstance(active, dict) or active.get("publication_status") not in {
+        "approved_for_publication", "published",
+    }:
+        return None
+    artifacts = active.get("runtime_artifacts")
+    if not isinstance(artifacts, dict):
         return None
     paths = {
-        "jurisdictions": root / "exact" / "jurisdictions.parquet",
-        "water_bodies": root / "exact" / "water_bodies.parquet",
-        "named_water_areas": root / "exact" / "named_water_areas.parquet",
-        "bbox_index": root / "predicate" / "bbox_index.parquet",
+        key: _catalog_artifact_path(artifacts.get(key))
+        for key in ("jurisdictions", "water_bodies", "named_water_areas", "bbox_index")
     }
-    return paths if all(parquet_available(path) for path in paths.values()) else None
+    if any(path is None for path in paths.values()):
+        return None
+    country_components = {
+        str(country).upper(): path
+        for country, record in (artifacts.get("country_components") or {}).items()
+        if (path := _catalog_artifact_path(record)) is not None
+    }
+    return {**paths, "country_components": country_components}
 
 
 def marine_bank_for_loc_id(loc_id: str | None) -> Optional[Path]:
@@ -131,8 +136,7 @@ def marine_bank_for_loc_id(loc_id: str | None) -> Optional[Path]:
             prefix = value.split("-", 1)[0]
             if is_water_body_loc_id(prefix):
                 return domain["jurisdictions"]
-            country_bank = _active_domain_root() / "country_components" / prefix / "marine_jurisdictions.parquet"
-            return country_bank if parquet_available(country_bank) else None
+            return domain["country_components"].get(prefix)
         return EEZ_PATH
     if is_named_water_loc_id(loc_id):
         if domain:

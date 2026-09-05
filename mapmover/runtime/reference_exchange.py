@@ -1133,6 +1133,31 @@ def _geometry_catalog_products(catalog: dict[str, Any], *, read_wip: bool = Fals
     return rows
 
 
+def _geometry_catalog_domains(catalog: dict[str, Any], *, read_wip: bool = False) -> list[dict[str, Any]]:
+    """Project independently versioned non-country geometry activation."""
+    rows: list[dict[str, Any]] = []
+    for profile in _geometry_catalog_records(catalog, "domain_profiles", read_wip=read_wip):
+        active = profile.get("active_release") if isinstance(profile.get("active_release"), dict) else {}
+        artifacts = active.get("runtime_artifacts") if isinstance(active.get("runtime_artifacts"), dict) else {}
+        country_components = artifacts.get("country_components") if isinstance(artifacts.get("country_components"), dict) else {}
+        rows.append({
+            "release_unit_id": profile.get("release_unit_id"),
+            "release_unit_kind": profile.get("release_unit_kind"),
+            "label": profile.get("label"),
+            "family_ids": profile.get("family_ids") or [],
+            "release_id": active.get("release_id") or profile.get("release_id"),
+            "release_version": active.get("release_version") or profile.get("release_version"),
+            "publication_status": active.get("publication_status") or profile.get("release_status"),
+            "version_manifest_path": active.get("version_manifest_path"),
+            "version_manifest_sha256": active.get("version_manifest_sha256"),
+            "runtime_artifacts": {
+                key: value for key, value in artifacts.items() if key != "country_components"
+            },
+            "country_component_count": len(country_components),
+        })
+    return sorted(rows, key=lambda item: str(item.get("release_unit_id") or ""))
+
+
 def _geometry_catalog_named_reference_objects(
     catalog: dict[str, Any], *, limit: int, read_wip: bool = False,
 ) -> dict[str, Any]:
@@ -1261,6 +1286,8 @@ def read_geometry_catalog(
         })
     if selected_view == "products":
         return _clean_json({**base, "products": _geometry_catalog_products(catalog, read_wip=read_wip)})
+    if selected_view == "domains":
+        return _clean_json({**base, "domains": _geometry_catalog_domains(catalog, read_wip=read_wip)})
     if selected_view == "named_reference_objects":
         return _clean_json({**base, "named_reference_objects": _geometry_catalog_named_reference_objects(catalog, limit=row_limit, read_wip=read_wip)})
     if selected_view == "full":
@@ -1307,7 +1334,7 @@ def read_geometry_catalog(
         "ok": False,
         "error": {
             "code": "invalid_view",
-            "message": "view must be one of capabilities, summary, countries, admin_coverage, crosswalk_artifacts, crosswalks, products, named_reference_objects, or full",
+            "message": "view must be one of capabilities, summary, countries, domains, admin_coverage, crosswalk_artifacts, crosswalks, products, named_reference_objects, or full",
         },
     })
 

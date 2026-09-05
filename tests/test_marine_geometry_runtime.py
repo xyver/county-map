@@ -1,11 +1,10 @@
 import unittest
-import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import mapmover.runtime.marine_geometry as marine_runtime
-from mapmover.runtime.geometry_catalog import _merge_release_profiles
+from mapmover.runtime.reference_exchange import _geometry_catalog_domains
 from mapmover.runtime.marine_geometry import (
     EEZ_PATH,
     WATER_BODIES_PATH,
@@ -19,54 +18,66 @@ from mapmover.runtime.geography_reference import is_named_water_loc_id
 
 
 class MarineGeometryRuntimeTests(unittest.TestCase):
-    def test_release_profile_overlay_patches_only_named_units(self):
-        base = {
-            "catalog_fingerprint": "base-1",
-            "country_profiles": [{"country_code": "USA", "release_version": "1"}],
-            "domain_profiles": [{"release_unit_id": "OTHER", "release_version": "1"}],
-        }
-        overlay = {
-            "profile": "geometry_release_profile_overlay",
-            "composition_mode": "patch",
-            "base_catalog_fingerprint": "base-1",
-            "country_profiles": [{"country_code": "USA", "release_version": "2"}],
-            "domain_profiles": [{"release_unit_id": "MARINE", "release_version": "1.0.1"}],
-        }
-        merged = _merge_release_profiles(base, overlay)
-        self.assertEqual(merged["country_profiles"][0]["release_version"], "2")
-        self.assertEqual(
-            {item["release_unit_id"] for item in merged["domain_profiles"]},
-            {"MARINE", "OTHER"},
-        )
+    def test_catalog_domain_projection_exposes_activation_without_component_bloat(self):
+        catalog = {"domain_profiles": [{
+            "release_unit_id": "MARINE",
+            "release_unit_kind": "global_domain",
+            "label": "Marine",
+            "family_ids": ["water_body", "marine_jurisdiction"],
+            "release_status": "published",
+            "active_release": {
+                "release_id": "marine_geometry_1_0_1",
+                "release_version": "1.0.1",
+                "publication_status": "published",
+                "runtime_artifacts": {
+                    "jurisdictions": {"path": "geometry/domains/MARINE/jurisdictions.parquet"},
+                    "country_components": {
+                        "USA": {"path": "geometry/domains/MARINE/country_components/USA.parquet"},
+                        "CAN": {"path": "geometry/domains/MARINE/country_components/CAN.parquet"},
+                    },
+                },
+            },
+        }]}
 
-    def test_active_domain_requires_admitted_pointer_and_complete_exact_banks(self):
+        domains = _geometry_catalog_domains(catalog)
+
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0]["release_unit_id"], "MARINE")
+        self.assertEqual(domains[0]["release_id"], "marine_geometry_1_0_1")
+        self.assertEqual(domains[0]["country_component_count"], 2)
+        self.assertNotIn("country_components", domains[0]["runtime_artifacts"])
+
+    def test_active_domain_uses_catalog_paths_without_runtime_pointer(self):
         with TemporaryDirectory() as tmp:
             data_root = Path(tmp)
             geometry_root = data_root / "geometry"
-            releases = geometry_root / "domains/MARINE/releases/geometry"
-            release = releases / "marine_geometry_1_0_0"
-            exact = release / "exact"
-            exact.mkdir(parents=True)
-            (release / "version.json").write_text("{}", encoding="utf-8")
-            for name in ("jurisdictions.parquet", "water_bodies.parquet", "named_water_areas.parquet"):
-                (exact / name).write_bytes(b"test")
-            predicate = release / "predicate"
-            predicate.mkdir()
-            (predicate / "bbox_index.parquet").write_bytes(b"test")
-            pointer = releases / "current.json"
-            pointer.write_text(json.dumps({
+            release_rel = "geometry/domains/MARINE/releases/geometry/marine_geometry_1_0_1"
+            runtime_artifacts = {
+                "jurisdictions": {"path": f"{release_rel}/exact/jurisdictions.parquet"},
+                "water_bodies": {"path": f"{release_rel}/exact/water_bodies.parquet"},
+                "named_water_areas": {"path": f"{release_rel}/exact/named_water_areas.parquet"},
+                "bbox_index": {"path": f"{release_rel}/predicate/bbox_index.parquet"},
+                "country_components": {
+                    "USA": {"path": f"{release_rel}/country_components/USA/marine_jurisdictions.parquet"},
+                },
+            }
+            catalog = {"domain_profiles": [{
                 "release_unit_id": "MARINE",
-                "publication_status": "adopted_local_unpublished",
-                "version_path": "geometry/domains/MARINE/releases/geometry/marine_geometry_1_0_0/version.json",
-            }), encoding="utf-8")
-
+                "active_release": {
+                    "publication_status": "published",
+                    "runtime_artifacts": runtime_artifacts,
+                },
+            }]}
             with patch.object(marine_runtime, "GEOMETRY_DIR", geometry_root), patch.object(
-                marine_runtime, "MARINE_DOMAIN_RELEASES_DIR", releases,
-            ), patch.object(marine_runtime, "MARINE_DOMAIN_POINTER", pointer):
-                self.assertEqual(marine_runtime._active_domain_root(), release)
+                marine_runtime, "load_geometry_catalog", return_value=catalog,
+            ):
                 self.assertEqual(
                     marine_runtime._active_domain_paths()["named_water_areas"],
-                    exact / "named_water_areas.parquet",
+                    data_root / runtime_artifacts["named_water_areas"]["path"],
+                )
+                self.assertEqual(
+                    marine_bank_for_loc_id("USA-EEZ-MRGID-8456"),
+                    data_root / runtime_artifacts["country_components"]["USA"]["path"],
                 )
 
     def test_classification(self):
