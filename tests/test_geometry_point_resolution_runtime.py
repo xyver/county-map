@@ -29,6 +29,35 @@ class GeometryPointResolutionRuntimeTests(unittest.TestCase):
         self._query_layout_patch.stop()
         clear_cache()
 
+    def test_batch_point_resolver_falls_back_to_marine_for_offshore_point(self):
+        import pandas as pd
+
+        countries = pd.DataFrame([
+            {
+                "loc_id": "USA", "name": "United States", "admin_level": 0,
+                "geometry": '{"type":"Polygon","coordinates":[[[-125,24],[-125,50],[-66,50],[-66,24],[-125,24]]]}',
+            }
+        ])
+        marine_result = {
+            "point": {"lon": -130.0, "lat": 35.0},
+            "matched": {"loc_id": "IHO1953-1", "name": "Pacific Ocean", "family": "water_body"},
+            "stack": [{"loc_id": "IHO1953-1", "name": "Pacific Ocean", "family": "water_body"}],
+            "overlap_families": [
+                {"loc_id": "USA-EEZ-MRGID-1", "family": "marine_jurisdiction", "relationship": "marine_jurisdiction"}
+            ],
+            "deepest_resolved_loc_id": "IHO1953-1",
+            "deepest_resolved_family": "water_body",
+            "resolution_family": "marine",
+        }
+        with patch("mapmover.geometry_handlers.load_global_countries_frame", return_value=countries), patch(
+            "mapmover.runtime.loc_id_resolution._resolve_point_to_marine_stack", return_value=marine_result,
+        ) as marine_resolver:
+            result = resolve_points_to_locations([{"lon": -130.0, "lat": 35.0}])[0]
+
+        self.assertEqual(result["matched"]["loc_id"], "IHO1953-1")
+        self.assertEqual(result["overlap_families"][0]["loc_id"], "USA-EEZ-MRGID-1")
+        marine_resolver.assert_called_once_with(-130.0, 35.0, include_geometry=False)
+
     def test_runtime_geometry_spine_prefers_smallest_covering_polygon(self):
         import pandas as pd
 

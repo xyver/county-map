@@ -22,6 +22,7 @@ from mapmover.routes.mcp import (
     ACCESS_LANE_PAID,
     ACCESS_LANE_TRUSTED_ARTIFACT,
     DATA_HELPER_CAPABILITIES,
+    _shape_resolve_point_payload,
     _provenance_summary,
     _access_lane,
     router as mcp_router,
@@ -49,6 +50,26 @@ def _tool_call_envelope(
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+class ResolvePointPayloadShapeTests(unittest.TestCase):
+    def test_marine_overlap_fields_survive_compact_mcp_shape(self):
+        raw = {
+            "point": {"lon": -130.0, "lat": 35.0},
+            "matched": {"loc_id": "IHO1953-1", "family": "water_body"},
+            "stack": [{"loc_id": "IHO1953-1", "family": "water_body"}],
+            "deepest_resolved_family": "water_body",
+            "overlap_families": [
+                {"loc_id": "USA-EEZ-MRGID-1", "family": "marine_jurisdiction", "relationship": "marine_jurisdiction"}
+            ],
+            "resolution_family": "marine",
+        }
+
+        shaped = _shape_resolve_point_payload(raw, "request-1")
+
+        self.assertEqual(shaped["deepest_resolved_family"], "water_body")
+        self.assertEqual(shaped["resolution_family"], "marine")
+        self.assertEqual(shaped["overlap_families"][0]["loc_id"], "USA-EEZ-MRGID-1")
 
 
 class LocalRuntimeAccessTests(unittest.TestCase):

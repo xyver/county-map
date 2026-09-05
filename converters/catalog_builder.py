@@ -413,6 +413,7 @@ def _build_root_index(data_root: Path, scopes: dict):
         "fallback_geometry": "geometry/{ISO3}.parquet",
         "data_catalog": "catalog.json",
         "geometry_catalog": "geometry/geometry_catalog.json",
+        "geometry_release_profiles": "geometry/release_profiles.json",
         "agent_catalog": "agent_catalog/api_catalog.json",
         "ops_catalog": "ops_feed_registry.json",
     }

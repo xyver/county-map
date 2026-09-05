@@ -1452,11 +1452,13 @@ export const MapAdapter = {
       </div>
     ` : '';
     const broaderWaterBodies = overlapFamilies.filter((entry) => entry?.relationship === 'broader_water_body');
+    const physicalWaterBodies = overlapFamilies.filter((entry) => entry?.relationship === 'physical_water_body');
     const overlappingJurisdictions = overlapFamilies.filter((entry) => entry?.relationship === 'marine_jurisdiction');
     // Older resolver responses did not label overlap relationships. Keep the
     // popup readable for them, but do not surface X* SST zones as locations.
     const unclassifiedOverlaps = overlapFamilies.filter((entry) => !entry?.relationship && !String(entry?.loc_id || '').startsWith('X'));
     const overlapsHtml = [
+      renderOverlapSection('Named water', physicalWaterBodies),
       renderOverlapSection('Broader water body', broaderWaterBodies),
       renderOverlapSection('Overlapping jurisdiction', overlappingJurisdictions),
       renderOverlapSection('Overlapping geometry', unclassifiedOverlaps),

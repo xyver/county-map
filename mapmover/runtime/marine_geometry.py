@@ -27,22 +27,38 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
-from ..duckdb_helpers import parquet_available, select_columns_from_parquet
+from ..duckdb_helpers import (
+    parquet_available,
+    parquet_columns,
+    path_to_uri,
+    quote_ident,
+    run_df,
+    select_columns_from_parquet,
+)
 from ..paths import GEOMETRY_DIR
-from .geography_reference import is_eez_loc_id, is_named_water_loc_id, is_water_body_loc_id
+from .geography_reference import (
+    is_marine_jurisdiction_loc_id,
+    is_named_water_loc_id,
+    is_water_body_loc_id,
+)
 
 MARINE_DIR = GEOMETRY_DIR / "marine"
 EEZ_PATH = MARINE_DIR / "eez.parquet"
 WATER_BODIES_PATH = MARINE_DIR / "water_bodies.parquet"
 IHO1953_NAMED_WATER_PATH = MARINE_DIR / "iho1953_sea_areas.parquet"
 GEOMETRY_CATALOG_PATH = GEOMETRY_DIR / "geometry_catalog.json"
+MARINE_DOMAIN_RELEASES_DIR = GEOMETRY_DIR / "domains" / "MARINE" / "releases" / "geometry"
+MARINE_DOMAIN_POINTER = MARINE_DOMAIN_RELEASES_DIR / "current.json"
 
 _MARINE_COLUMNS = ["loc_id", "name", "geometry", "centroid_lon", "centroid_lat"]
+_MARINE_POINT_COLUMNS = _MARINE_COLUMNS + [
+    "bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat",
+]
 
 
 def is_marine_loc_id(loc_id: str | None) -> bool:
     """True for either marine overlay family or canonical named water."""
-    return is_eez_loc_id(loc_id) or is_water_body_loc_id(loc_id) or is_named_water_loc_id(loc_id)
+    return is_marine_jurisdiction_loc_id(loc_id) or is_water_body_loc_id(loc_id) or is_named_water_loc_id(loc_id)
 
 
 def _catalog_approves_geometry(path: Path) -> bool:
@@ -72,19 +88,67 @@ def named_water_bank_approved(loc_id: str | None = None) -> bool:
     return _catalog_approves_geometry(IHO1953_NAMED_WATER_PATH)
 
 
+def _active_domain_root() -> Optional[Path]:
+    """Return only an explicitly admitted immutable Marine release root."""
+    try:
+        pointer = json.loads(MARINE_DOMAIN_POINTER.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if pointer.get("release_unit_id") != "MARINE":
+        return None
+    if pointer.get("publication_status") not in {
+        "adopted_local_unpublished", "approved_for_publication", "published",
+    }:
+        return None
+    version_path = GEOMETRY_DIR.parent / str(pointer.get("version_path") or "")
+    try:
+        release_root = version_path.resolve().parent
+        release_root.relative_to(MARINE_DOMAIN_RELEASES_DIR.resolve())
+    except (OSError, ValueError):
+        return None
+    return release_root if version_path.is_file() else None
+
+
+def _active_domain_paths() -> Optional[dict[str, Path]]:
+    root = _active_domain_root()
+    if root is None:
+        return None
+    paths = {
+        "jurisdictions": root / "exact" / "jurisdictions.parquet",
+        "water_bodies": root / "exact" / "water_bodies.parquet",
+        "named_water_areas": root / "exact" / "named_water_areas.parquet",
+        "bbox_index": root / "predicate" / "bbox_index.parquet",
+    }
+    return paths if all(parquet_available(path) for path in paths.values()) else None
+
+
 def marine_bank_for_loc_id(loc_id: str | None) -> Optional[Path]:
     """Return the marine geometry bank that owns this loc_id, or None."""
-    if is_eez_loc_id(loc_id):
+    value = str(loc_id or "").strip().upper()
+    domain = _active_domain_paths()
+    if is_marine_jurisdiction_loc_id(loc_id):
+        if domain and not value.startswith("EEZ-"):
+            prefix = value.split("-", 1)[0]
+            if is_water_body_loc_id(prefix):
+                return domain["jurisdictions"]
+            country_bank = _active_domain_root() / "country_components" / prefix / "marine_jurisdictions.parquet"
+            return country_bank if parquet_available(country_bank) else None
         return EEZ_PATH
     if is_named_water_loc_id(loc_id):
+        if domain:
+            return domain["named_water_areas"]
         return IHO1953_NAMED_WATER_PATH if named_water_bank_approved(loc_id) else None
     if is_water_body_loc_id(loc_id):
+        if domain:
+            return domain["water_bodies"]
         return WATER_BODIES_PATH
     return None
 
 
 def has_marine_geometry() -> bool:
     """True when at least one marine bank is readable (local or cloud)."""
+    if _active_domain_paths():
+        return True
     return (
         parquet_available(EEZ_PATH)
         or parquet_available(WATER_BODIES_PATH)
@@ -106,7 +170,8 @@ def resolve_marine_geometry_source(loc_id: str | None) -> dict:
         "parquet_file": bank if accessible else None,
         "source_kind": "marine_bank" if accessible else "missing",
         "marine_kind": (
-            "marine_eez" if is_eez_loc_id(loc_id)
+            ("marine_eez" if str(loc_id or "").strip().upper().startswith("EEZ-") else "marine_jurisdiction")
+            if is_marine_jurisdiction_loc_id(loc_id)
             else "named_water" if is_named_water_loc_id(loc_id)
             else "water_body"
         ),
@@ -114,13 +179,21 @@ def resolve_marine_geometry_source(loc_id: str | None) -> dict:
 
 
 def _read_bank(path: Path, want: Optional[set], columns: Optional[list[str]] = None) -> pd.DataFrame:
-    selected_columns = [column for column in (columns or _MARINE_COLUMNS) if column in _MARINE_COLUMNS]
+    selected_columns = [column for column in (columns or _MARINE_COLUMNS) if column in _MARINE_POINT_COLUMNS]
     if "loc_id" not in selected_columns:
         selected_columns.insert(0, "loc_id")
     if not parquet_available(path):
         return pd.DataFrame(columns=selected_columns)
     try:
-        df = select_columns_from_parquet(path, selected_columns)
+        if want:
+            placeholders = ", ".join("?" for _ in want)
+            selected_sql = ", ".join(quote_ident(column) for column in selected_columns)
+            df = run_df(
+                f"SELECT {selected_sql} FROM read_parquet(?) WHERE loc_id IN ({placeholders})",
+                [path_to_uri(path), *sorted(want)],
+            )
+        else:
+            df = select_columns_from_parquet(path, selected_columns)
     except Exception:
         df = None
     if df is None or df.empty:
@@ -133,6 +206,72 @@ def _read_bank(path: Path, want: Optional[set], columns: Optional[list[str]] = N
     return df
 
 
+def _read_bank_at_point(path: Path, lon: float, lat: float) -> pd.DataFrame:
+    """Read only rows whose stored bounds can contain a point.
+
+    Marine polygons are large enough that loading every geometry made a water
+    click unnecessarily slow. The bounds predicate is only a cheap candidate
+    filter; the resolver still performs exact Shapely containment afterward.
+    """
+    if not parquet_available(path):
+        return pd.DataFrame(columns=_MARINE_POINT_COLUMNS)
+    available = parquet_columns(path)
+    selected = [column for column in _MARINE_POINT_COLUMNS if column in available]
+    if "geometry" not in selected or "loc_id" not in selected:
+        return pd.DataFrame(columns=selected)
+    select_sql = ", ".join(quote_ident(column) for column in selected)
+    if {"bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat"}.issubset(available):
+        sql = (
+            f"SELECT {select_sql} FROM read_parquet(?) "
+            "WHERE bbox_min_lon <= ? AND bbox_max_lon >= ? "
+            "AND bbox_min_lat <= ? AND bbox_max_lat >= ?"
+        )
+        return run_df(sql, [path_to_uri(path), lon, lon, lat, lat])
+    return select_columns_from_parquet(path, selected)
+
+
+def _read_bbox_index_at_point(path: Path, lon: float, lat: float) -> pd.DataFrame:
+    columns = ["loc_id", "bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat"]
+    if not parquet_available(path) or not set(columns).issubset(parquet_columns(path)):
+        return pd.DataFrame(columns=columns)
+    selected_sql = ", ".join(quote_ident(column) for column in columns)
+    return run_df(
+        f"SELECT {selected_sql} FROM read_parquet(?) "
+        "WHERE bbox_min_lon <= ? AND bbox_max_lon >= ? "
+        "AND bbox_min_lat <= ? AND bbox_max_lat >= ?",
+        [path_to_uri(path), lon, lon, lat, lat],
+    )
+
+
+def load_marine_geometry_at_point(lon: float, lat: float) -> pd.DataFrame:
+    """Load bbox-filtered candidates from every approved marine point bank."""
+    domain = _active_domain_paths()
+    if domain:
+        bbox_candidates = _read_bbox_index_at_point(domain["bbox_index"], float(lon), float(lat))
+        jurisdiction_ids = (
+            set(bbox_candidates["loc_id"].astype(str))
+            if bbox_candidates is not None and not bbox_candidates.empty else set()
+        )
+        frames = []
+        if jurisdiction_ids:
+            frames.append(_read_bank(
+                domain["jurisdictions"], jurisdiction_ids, columns=_MARINE_POINT_COLUMNS,
+            ))
+        frames.extend([
+            _read_bank_at_point(domain["water_bodies"], float(lon), float(lat)),
+            _read_bank_at_point(domain["named_water_areas"], float(lon), float(lat)),
+        ])
+    else:
+        paths = [EEZ_PATH, WATER_BODIES_PATH]
+        if named_water_bank_approved("IHO1953-0"):
+            paths.append(IHO1953_NAMED_WATER_PATH)
+        frames = [_read_bank_at_point(path, float(lon), float(lat)) for path in paths]
+    frames = [frame for frame in frames if frame is not None and not frame.empty]
+    if not frames:
+        return pd.DataFrame(columns=_MARINE_POINT_COLUMNS)
+    return pd.concat(frames, ignore_index=True).reset_index(drop=True)
+
+
 def load_marine_geometry(loc_ids: Optional[Iterable[str]] = None, *, columns: Optional[list[str]] = None) -> pd.DataFrame:
     """Load marine geometry rows for the given loc_ids (or all marine geometry).
 
@@ -142,17 +281,21 @@ def load_marine_geometry(loc_ids: Optional[Iterable[str]] = None, *, columns: Op
     that only need availability metadata can omit the heavy geometry column.
     """
     want = {str(x).strip() for x in loc_ids} if loc_ids is not None else None
-    need_eez = want is None or any(is_eez_loc_id(x) for x in want)
+    need_eez = want is None or any(is_marine_jurisdiction_loc_id(x) for x in want)
     need_wb = want is None or any(is_water_body_loc_id(x) for x in want)
     need_named_water = want is None or any(is_named_water_loc_id(x) for x in want)
 
+    domain = _active_domain_paths()
     frames = []
     if need_eez:
-        frames.append(_read_bank(EEZ_PATH, want, columns=columns))
+        jurisdiction_banks = {marine_bank_for_loc_id(value) for value in want} if want is not None else {
+            domain["jurisdictions"] if domain else EEZ_PATH
+        }
+        frames.extend(_read_bank(path, want, columns=columns) for path in jurisdiction_banks if path is not None)
     if need_wb:
-        frames.append(_read_bank(WATER_BODIES_PATH, want, columns=columns))
-    if need_named_water and named_water_bank_approved("IHO1953-0"):
-        frames.append(_read_bank(IHO1953_NAMED_WATER_PATH, want, columns=columns))
+        frames.append(_read_bank(domain["water_bodies"] if domain else WATER_BODIES_PATH, want, columns=columns))
+    if need_named_water and (domain or named_water_bank_approved("IHO1953-0")):
+        frames.append(_read_bank(domain["named_water_areas"] if domain else IHO1953_NAMED_WATER_PATH, want, columns=columns))
     if not frames:
         return pd.DataFrame(columns=columns or _MARINE_COLUMNS)
     return pd.concat(frames, ignore_index=True).reset_index(drop=True)

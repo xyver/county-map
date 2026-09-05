@@ -1628,15 +1628,43 @@ def resolve_points_to_locations(
             by_country.setdefault(scope_iso3, []).append(item)
         _add_timing_ms(timing_ms, "country_scope_ms", stage_started)
     else:
-        country_index = geometry_spine_index_for_frame(country_df)
-        country_matches = country_index.match_points(normalized_points) if country_index is not None else [None] * len(normalized_points)
-        for item, country_spine_match in zip(normalized_points, country_matches):
+        if len(normalized_points) <= 8:
+            # Building the global STRtree dominates an interactive one-point
+            # lookup. Its existing bbox shortlist is substantially faster for
+            # the map button and ordinary MCP calls.
+            country_matches = [
+                _find_containing_country_with_fallback(
+                    country_df, float(item.get("lon", 0)), float(item.get("lat", 0)),
+                ) if not item.get("error") else None
+                for item in normalized_points
+            ]
+            used_global_index = False
+        else:
+            country_index = geometry_spine_index_for_frame(country_df)
+            spine_matches = country_index.match_points(normalized_points) if country_index is not None else [None] * len(normalized_points)
+            country_matches = [match.row if match is not None else None for match in spine_matches]
+            used_global_index = True
+        for item, country_match in zip(normalized_points, country_matches):
             if item.get("error"):
                 results[item["index"]] = {"error": item["error"]}
                 continue
             lon = float(item["lon"])
             lat = float(item["lat"])
-            country_match = country_spine_match.row if country_spine_match is not None else _find_containing_country_with_fallback(country_df, lon, lat)
+            if country_match is None:
+                # A bbox/index miss is normally offshore. Resolve the compact
+                # Marine predicate index before invoking the expensive legacy
+                # country-bank fallback; land still wins whenever the global
+                # Admin0 spine contains the point.
+                from .runtime.loc_id_resolution import _resolve_point_to_marine_stack
+
+                marine_result = _resolve_point_to_marine_stack(
+                    lon, lat, include_geometry=include_geometry,
+                )
+                if marine_result is not None:
+                    results[item["index"]] = marine_result
+                    continue
+                if used_global_index:
+                    country_match = _find_containing_country_with_fallback(country_df, lon, lat)
             if country_match is None:
                 results[item["index"]] = {"error": "No containing country found", "point": {"lon": lon, "lat": lat}}
                 continue
@@ -1907,6 +1935,77 @@ def resolve_points_to_locations(
             if include_geometry:
                 result["geojson"] = get_selection_geometries([deepest_loc_id])
             results[item["index"]] = result
+
+    # Country geometry intentionally excludes marine jurisdiction. Give every
+    # otherwise-unresolved offshore point the same marine resolver used by the
+    # single-point loc_id stack so the map, JSON API, and MCP batch path do not
+    # fail merely because no land Admin0 contains the coordinate.
+    marine_candidates = [
+        item for item in normalized_points
+        if not item.get("error")
+        and isinstance(results[item["index"]], dict)
+        and results[item["index"]].get("error") == "No containing country found"
+    ]
+    if marine_candidates:
+        from .runtime.loc_id_resolution import _resolve_point_to_marine_stack
+
+        stage_started = time.perf_counter()
+        for item in marine_candidates:
+            marine_result = _resolve_point_to_marine_stack(
+                float(item["lon"]), float(item["lat"]), include_geometry=include_geometry,
+            )
+            if marine_result is not None:
+                results[item["index"]] = marine_result
+        _add_timing_ms(timing_ms, "marine_match_ms", stage_started)
+
+    # A coastal coordinate can truthfully match both a land/admin polygon and
+    # marine families (for example a census water polygon plus an EEZ). Keep
+    # the admin spine as the primary answer, but expose the marine context as
+    # parallel overlaps instead of making callers choose one geometry domain.
+    admin_candidates = [
+        item for item in normalized_points
+        if not item.get("error")
+        and isinstance(results[item["index"]], dict)
+        and not results[item["index"]].get("error")
+        and results[item["index"]].get("country")
+    ]
+    if admin_candidates:
+        from .runtime.loc_id_resolution import _resolve_point_to_marine_stack
+
+        stage_started = time.perf_counter()
+        for item in admin_candidates:
+            marine_result = _resolve_point_to_marine_stack(
+                float(item["lon"]), float(item["lat"]), include_geometry=False,
+            )
+            if marine_result is None:
+                continue
+            result = results[item["index"]]
+            marine_matched = marine_result.get("matched") or {}
+            context: list[dict] = []
+            if marine_matched.get("loc_id"):
+                marine_family = marine_matched.get("family")
+                context.append({
+                    "loc_id": marine_matched.get("loc_id"),
+                    "name": marine_matched.get("name"),
+                    "family": marine_family,
+                    "admin_level": None,
+                    "relationship": (
+                        "marine_jurisdiction"
+                        if marine_family in {"marine_eez", "marine_jurisdiction"}
+                        else "physical_water_body"
+                    ),
+                })
+            context.extend(marine_result.get("overlap_families") or [])
+            seen: set[str] = set()
+            result["overlap_families"] = [
+                entry for entry in [*(result.get("overlap_families") or []), *context]
+                if entry.get("loc_id") and not (entry["loc_id"] in seen or seen.add(entry["loc_id"]))
+            ]
+            result["marine_context"] = {
+                "matched": marine_matched or None,
+                "resolution_family": "marine",
+            }
+        _add_timing_ms(timing_ms, "marine_context_ms", stage_started)
 
     # Fan the representative result back out to the duplicates it stood in for.
     for source_index, target_indexes in duplicate_targets.items():

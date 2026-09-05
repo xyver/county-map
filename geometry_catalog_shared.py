@@ -143,7 +143,7 @@ def published_geometry_catalog_records(catalog: dict[str, Any], key: str) -> lis
             for token in ("staged", "prepar", "research", "blocked", "in_progress", "wip")
         ):
             continue
-        if key == "country_profiles":
+        if key in {"country_profiles", "domain_profiles"}:
             release_status = str(item.get("release_status") or "").strip().lower()
             if release_status and release_status not in {"approved_for_publication", "published"}:
                 continue

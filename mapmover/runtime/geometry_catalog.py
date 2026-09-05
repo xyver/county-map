@@ -26,6 +26,40 @@ from geometry_catalog_shared import (
 
 CATALOG_PATH = GEOMETRY_DIR / "geometry_catalog.json"
 CROSSWALK_CATALOG_PATH = GEOMETRY_DIR / "crosswalk_catalog.json"
+RELEASE_PROFILES_PATH = GEOMETRY_DIR / "release_profiles.json"
+
+
+def _merge_release_profiles(payload: dict[str, Any], overlay: Any) -> dict[str, Any]:
+    if not isinstance(overlay, dict):
+        return payload
+    if overlay.get("profile") != "geometry_release_profile_overlay":
+        return payload
+    if overlay.get("base_catalog_fingerprint") != payload.get("catalog_fingerprint"):
+        return payload
+    merged = dict(payload)
+    keys = {
+        "country_family_coverage": "country_code",
+        "country_profiles": "country_code",
+        "domain_profiles": "release_unit_id",
+        "release_packages": "package_id",
+    }
+    for key, identity_key in keys.items():
+        updates = overlay.get(key)
+        if not isinstance(updates, list):
+            continue
+        if overlay.get("composition_mode") != "patch":
+            merged[key] = updates
+            continue
+        by_id = {
+            str(item.get(identity_key) or "").upper(): item
+            for item in (payload.get(key) or []) if isinstance(item, dict)
+        }
+        for item in updates:
+            if isinstance(item, dict) and str(item.get(identity_key) or "").strip():
+                by_id[str(item.get(identity_key)).upper()] = item
+        merged[key] = sorted(by_id.values(), key=lambda item: str(item.get(identity_key) or ""))
+    merged["release_profile_overlay_fingerprint"] = overlay.get("overlay_fingerprint")
+    return merged
 
 
 def _empty_country_catalog(country: str) -> dict[str, Any]:
@@ -81,7 +115,11 @@ def load_geometry_catalog() -> dict[str, Any]:
         try:
             payload = _fetch_geometry_catalog_from_s3()
             if isinstance(payload, dict):
-                return _merge_crosswalks(payload)
+                try:
+                    overlay = read_artifact_json("geometry/release_profiles.json", lane="active")
+                except Exception:
+                    overlay = None
+                return _merge_crosswalks(_merge_release_profiles(payload, overlay))
         except Exception:
             pass
 
@@ -89,7 +127,11 @@ def load_geometry_catalog() -> dict[str, Any]:
         try:
             payload = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                return _merge_crosswalks(payload)
+                try:
+                    overlay = json.loads(RELEASE_PROFILES_PATH.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    overlay = None
+                return _merge_crosswalks(_merge_release_profiles(payload, overlay))
         except (OSError, json.JSONDecodeError):
             pass
 

@@ -73,7 +73,19 @@ def is_water_body_loc_id(loc_id: str | None) -> bool:
 
 
 def is_eez_loc_id(loc_id: str | None) -> bool:
-    return str(loc_id or "").strip().upper().startswith("EEZ-")
+    value = str(loc_id or "").strip().upper()
+    return bool(
+        value.startswith("EEZ-")
+        or re.fullmatch(r"[A-Z]{3}-EEZ(?:-[A-Z0-9]+(?:-[A-Z0-9]+)*)?", value)
+    )
+
+
+def is_marine_jurisdiction_loc_id(loc_id: str | None) -> bool:
+    """True for legacy EEZ ids and country/ocean-scoped Marine releases."""
+    value = str(loc_id or "").strip().upper()
+    return is_eez_loc_id(value) or bool(
+        re.fullmatch(r"[A-Z]{3}-(?:TS|CZ|IW|AW|HS|ECS)(?:-[A-Z0-9]+(?:-[A-Z0-9]+)*)?", value)
+    )
 
 
 def is_named_water_loc_id(loc_id: str | None) -> bool:
@@ -137,8 +149,8 @@ def classify_loc_id_family(loc_id: str | None) -> str | None:
         return None
     if is_water_body_loc_id(value):
         return "water_body"
-    if is_eez_loc_id(value):
-        return "marine_eez"
+    if is_marine_jurisdiction_loc_id(value):
+        return "marine_eez" if value.startswith("EEZ-") else "marine_jurisdiction"
     if is_named_water_loc_id(value):
         return "water_body"
     if re.fullmatch(r"[A-Z]{3}", value):

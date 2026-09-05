@@ -25,7 +25,7 @@ from .geography_reference import (
     load_conversions,
     translate_geometry_id_to_local_id,
 )
-from .marine_geometry import load_marine_geometry
+from .marine_geometry import load_marine_geometry_at_point
 from .place_lookup import resolve_populated_place
 
 _LOC_ID_RE = re.compile(r"^[A-Z]{3}(?:-[A-Z0-9]+)+$|^[A-Z]{3}$")
@@ -95,7 +95,7 @@ def _resolve_point_to_marine_stack(
     *,
     include_geometry: bool = False,
 ) -> dict[str, Any] | None:
-    marine_df = load_marine_geometry()
+    marine_df = load_marine_geometry_at_point(lon, lat)
     if marine_df is None or marine_df.empty:
         return None
 
@@ -121,7 +121,7 @@ def _resolve_point_to_marine_stack(
     # water zones are SST product aggregates, not point-location geography;
     # retain them nowhere in the returned location stack. EEZs are genuine
     # overlapping jurisdictions, but not the physical water-body answer.
-    family_order = {"named_water": 0, "marine_eez": 1, "water_body": 2}
+    family_order = {"named_water": 0, "marine_jurisdiction": 1, "marine_eez": 1, "water_body": 2}
     matches: list[dict[str, Any]] = []
     for _, row in candidates.iterrows():
         loc_id = str(row.get("loc_id") or "").strip()
@@ -160,7 +160,7 @@ def _resolve_point_to_marine_stack(
             continue
         if entry.get("named_water") and deepest.get("named_water"):
             relationship = "broader_water_body"
-        elif entry.get("family") == "marine_eez":
+        elif entry.get("family") in {"marine_jurisdiction", "marine_eez"}:
             relationship = "marine_jurisdiction"
         else:
             # X* zones are valid SST aggregation geometry, but not a second

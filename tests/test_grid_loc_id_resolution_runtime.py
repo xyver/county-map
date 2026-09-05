@@ -188,6 +188,8 @@ class GridLocIdResolutionRuntimeTests(unittest.TestCase):
         self.assertEqual(classify_grid_target_loc_id("EEZ-ASM"), "marine_eez")
         self.assertEqual(classify_grid_target_loc_id("EEZ-MRGID-21801"), "marine_eez")
         self.assertTrue(is_eez_loc_id("EEZ-USA"))
+        self.assertTrue(is_eez_loc_id("USA-EEZ-MRGID-8456"))
+        self.assertTrue(is_eez_loc_id("XOP-EEZ-MRGID-8456"))
         self.assertFalse(is_eez_loc_id("USA"))
         self.assertFalse(is_eez_loc_id("XOP"))
 
