@@ -127,14 +127,21 @@ def _resolve_point_to_marine_stack(
         loc_id = str(row.get("loc_id") or "").strip()
         if not loc_id:
             continue
-        geom_value = row.get("geometry")
+        wkb_value = row.get("geometry_wkb")
+        geom_value = wkb_value if isinstance(wkb_value, (bytes, bytearray, memoryview)) else row.get("geometry")
         if not geom_value:
             continue
         try:
-            geometry = json.loads(geom_value) if isinstance(geom_value, str) else geom_value
-            if not geometry or geometry.get("type") == "Point":
-                continue
-            if not shape(geometry).covers(point):
+            if isinstance(geom_value, (bytes, bytearray, memoryview)):
+                from shapely import wkb
+
+                exact_shape = wkb.loads(bytes(geom_value))
+            else:
+                geometry = json.loads(geom_value) if isinstance(geom_value, str) else geom_value
+                if not geometry or geometry.get("type") == "Point":
+                    continue
+                exact_shape = shape(geometry)
+            if exact_shape.geom_type == "Point" or not exact_shape.covers(point):
                 continue
         except Exception:
             continue
@@ -145,7 +152,7 @@ def _resolve_point_to_marine_stack(
             "name": row.get("name"),
             "family": family,
             "family_rank": family_order["named_water"] if named_water else family_order.get(family, 99),
-            "geometry_area": float(shape(geometry).area),
+            "geometry_area": float(row.get("area_km2") or exact_shape.area),
             "named_water": named_water,
         })
 

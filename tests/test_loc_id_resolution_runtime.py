@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from mapmover.name_standardizer import NameStandardizer
 from mapmover.runtime.loc_id_resolution import (
+    _resolve_point_to_marine_stack,
     resolve_admin_text_to_loc_id,
     resolve_place_to_loc_id_stack,
     resolve_place_to_point,
@@ -16,6 +17,24 @@ from mapmover.runtime.geometry_catalog import resolve_geometry_name
 
 
 class LocIdResolutionRuntimeTests(unittest.TestCase):
+    def test_marine_point_resolution_reads_exact_wkb_predicate_geometry(self):
+        from shapely.geometry import Polygon
+
+        candidates = pd.DataFrame([{
+            "loc_id": "XOP-EEZ-MRGID-8456",
+            "name": "United States Pacific EEZ",
+            "geometry_wkb": Polygon([(-120, 32), (-120, 34), (-118, 34), (-118, 32)]).wkb,
+            "area_km2": 10.0,
+        }])
+        with patch(
+            "mapmover.runtime.loc_id_resolution.load_marine_geometry_at_point",
+            return_value=candidates,
+        ):
+            resolved = _resolve_point_to_marine_stack(-119.0, 33.0)
+
+        self.assertEqual(resolved["deepest_resolved_loc_id"], "XOP-EEZ-MRGID-8456")
+        self.assertEqual(resolved["resolution_family"], "marine")
+
     def test_direct_loc_id_passthrough_normalizes_geometry_family_to_local(self):
         resolved = resolve_admin_text_to_loc_id("USA-G125186-G282830")
         self.assertEqual(resolved["match_type"], "direct_loc_id")

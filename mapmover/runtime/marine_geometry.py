@@ -21,6 +21,8 @@ not specific to one pack.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -49,6 +51,7 @@ IHO1953_NAMED_WATER_PATH = MARINE_DIR / "iho1953_sea_areas.parquet"
 GEOMETRY_CATALOG_PATH = GEOMETRY_DIR / "geometry_catalog.json"
 _MARINE_COLUMNS = ["loc_id", "name", "geometry", "centroid_lon", "centroid_lat"]
 _MARINE_POINT_COLUMNS = _MARINE_COLUMNS + [
+    "geometry_wkb", "area_km2",
     "bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat",
 ]
 
@@ -124,7 +127,14 @@ def _active_domain_paths() -> Optional[dict[str, Any]]:
         for country, record in (artifacts.get("country_components") or {}).items()
         if (path := _catalog_artifact_path(record)) is not None
     }
-    return {**paths, "country_components": country_components}
+    point_shards = {
+        str(shard): path
+        for shard, record in (artifacts.get("point_shards") or {}).items()
+        if (path := _catalog_artifact_path(record)) is not None
+    }
+    if len(point_shards) != 32:
+        return None
+    return {**paths, "country_components": country_components, "point_shards": point_shards}
 
 
 def marine_bank_for_loc_id(loc_id: str | None) -> Optional[Path]:
@@ -247,6 +257,28 @@ def _read_bbox_index_at_point(path: Path, lon: float, lat: float) -> pd.DataFram
     )
 
 
+def _point_shard_id(loc_id: str) -> str:
+    digest = hashlib.sha256(str(loc_id).encode("utf-8")).hexdigest()
+    return f"{int(digest, 16) % 32:02d}"
+
+
+def _read_point_shard(path: Path, want: set[str]) -> pd.DataFrame:
+    columns = [
+        "loc_id", "name", "geometry_wkb", "area_km2",
+        "bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat",
+    ]
+    if not path or not want or not parquet_available(path):
+        return pd.DataFrame(columns=columns)
+    if not set(columns).issubset(parquet_columns(path)):
+        return pd.DataFrame(columns=columns)
+    placeholders = ", ".join("?" for _ in want)
+    selected_sql = ", ".join(quote_ident(column) for column in columns)
+    return run_df(
+        f"SELECT {selected_sql} FROM read_parquet(?) WHERE loc_id IN ({placeholders})",
+        [path_to_uri(path), *sorted(want)],
+    )
+
+
 def load_marine_geometry_at_point(lon: float, lat: float) -> pd.DataFrame:
     """Load bbox-filtered candidates from every approved marine point bank."""
     domain = _active_domain_paths()
@@ -256,11 +288,14 @@ def load_marine_geometry_at_point(lon: float, lat: float) -> pd.DataFrame:
             set(bbox_candidates["loc_id"].astype(str))
             if bbox_candidates is not None and not bbox_candidates.empty else set()
         )
-        frames = []
-        if jurisdiction_ids:
-            frames.append(_read_bank(
-                domain["jurisdictions"], jurisdiction_ids, columns=_MARINE_POINT_COLUMNS,
-            ))
+        by_shard: dict[str, set[str]] = {}
+        for loc_id in jurisdiction_ids:
+            by_shard.setdefault(_point_shard_id(loc_id), set()).add(loc_id)
+        frames = [
+            _read_point_shard(domain["point_shards"].get(shard), ids)
+            for shard, ids in sorted(by_shard.items())
+            if domain["point_shards"].get(shard) is not None
+        ]
         frames.extend([
             _read_bank_at_point(domain["water_bodies"], float(lon), float(lat)),
             _read_bank_at_point(domain["named_water_areas"], float(lon), float(lat)),

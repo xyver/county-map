@@ -35,6 +35,10 @@ class MarineGeometryRuntimeTests(unittest.TestCase):
                         "USA": {"path": "geometry/domains/MARINE/country_components/USA.parquet"},
                         "CAN": {"path": "geometry/domains/MARINE/country_components/CAN.parquet"},
                     },
+                    "point_shards": {
+                        f"{index:02d}": {"path": f"geometry/domains/MARINE/point_shards/{index:02d}.parquet"}
+                        for index in range(32)
+                    },
                 },
             },
         }]}
@@ -45,7 +49,9 @@ class MarineGeometryRuntimeTests(unittest.TestCase):
         self.assertEqual(domains[0]["release_unit_id"], "MARINE")
         self.assertEqual(domains[0]["release_id"], "marine_geometry_1_0_1")
         self.assertEqual(domains[0]["country_component_count"], 2)
+        self.assertEqual(domains[0]["point_shard_count"], 32)
         self.assertNotIn("country_components", domains[0]["runtime_artifacts"])
+        self.assertNotIn("point_shards", domains[0]["runtime_artifacts"])
 
     def test_active_domain_uses_catalog_paths_without_runtime_pointer(self):
         with TemporaryDirectory() as tmp:
@@ -57,6 +63,10 @@ class MarineGeometryRuntimeTests(unittest.TestCase):
                 "water_bodies": {"path": f"{release_rel}/exact/water_bodies.parquet"},
                 "named_water_areas": {"path": f"{release_rel}/exact/named_water_areas.parquet"},
                 "bbox_index": {"path": f"{release_rel}/predicate/bbox_index.parquet"},
+                "point_shards": {
+                    f"{index:02d}": {"path": f"{release_rel}/predicate/point_shards/{index:02d}.parquet"}
+                    for index in range(32)
+                },
                 "country_components": {
                     "USA": {"path": f"{release_rel}/country_components/USA/marine_jurisdictions.parquet"},
                 },
