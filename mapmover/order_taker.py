@@ -15,6 +15,7 @@ from .runtime.preprocessor_context_runtime import build_tier3_context, build_tie
 from .runtime.llm_policy import (
     build_provider_runtime_context,
     resolve_lane_llm_selection,
+    sampling_kwargs,
 )
 from .runtime.geography_reference import load_conversions
 from .runtime.prompt_runtime import build_cached_system_prompt_blocks
@@ -107,15 +108,19 @@ def interpret_request(
                 system=system_blocks,
                 messages=chat_messages,
                 tools=tools,
-                temperature=llm_selection.temperature,
                 max_tokens=500,
+                **sampling_kwargs(llm_selection.model, llm_selection.temperature),
             )
             if usage_recorder is not None:
                 usage_recorder.record(response)
 
             if response.stop_reason == "tool_use":
                 tool_results = []
-                assistant_content = []
+                # Preserve the provider's complete assistant turn verbatim.
+                # Sonnet 5 enables adaptive thinking by default and requires
+                # thinking blocks (including their signatures) to be passed
+                # back unchanged on the next tool-loop request.
+                assistant_content = list(response.content)
                 for block in response.content:
                     if block.type == "tool_use":
                         tool_name = block.name
@@ -137,9 +142,6 @@ def interpret_request(
                             "tool_use_id": block.id,
                             "content": formatted_result,
                         })
-                        assistant_content.append(block)
-                    elif block.type == "text":
-                        assistant_content.append(block)
 
                 chat_messages.append({
                     "role": "assistant",

@@ -267,6 +267,7 @@ class LLMUsageRecorder:
     caller_label: Optional[str] = None
     caller_binding: Optional[str] = None
     caller_confidence: Optional[str] = None
+    access_tier: Optional[str] = None
     identity_kind: Optional[str] = None
     auth_user_id: Optional[str] = None
     plan_id: Optional[str] = None
@@ -330,6 +331,8 @@ class LLMUsageRecorder:
         }
         if self.identity_kind:
             metadata["identity_kind"] = self.identity_kind
+        if self.access_tier:
+            metadata["access_tier"] = self.access_tier
         if self.tool_names:
             metadata["tool_names"] = self.tool_names
         if self.extra_metadata:

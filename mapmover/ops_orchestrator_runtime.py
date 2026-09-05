@@ -22,6 +22,7 @@ from mapmover import logger
 from mapmover.foundation_helpers import load_reference_dict
 from mapmover.preprocessor_locations import detect_location_candidates
 from mapmover.routes.disasters.related import _classify_exact_event_identifier
+from mapmover.runtime.llm_policy import sampling_kwargs
 from mapmover.runtime.loc_id_resolution import resolve_point_to_loc_id_stack
 from mapmover.runtime.preprocess_user_intents import normalize_query_for_location_matching
 from mapmover.runtime_config import get_runtime_config
@@ -5921,8 +5922,8 @@ def run_ops_chat(
         model=llm_selection.model,
         system=system_blocks,
         messages=messages,
-        temperature=llm_selection.temperature,
         max_tokens=700,
+        **sampling_kwargs(llm_selection.model, llm_selection.temperature),
     )
     if usage_recorder is not None:
         usage_recorder.record(response)

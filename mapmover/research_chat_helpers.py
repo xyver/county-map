@@ -89,9 +89,15 @@ def _sample_prompt_metrics(metrics: list | None, limit: int) -> list[str]:
 
 
 def _temperature_kwargs(model: str, temperature: float) -> dict:
-    if "opus-4-7" in (model or "").lower():
-        return {}
-    return {"temperature": temperature}
+    """Research-lane alias for the shared sampling-capability helper.
+
+    Kept as a named function because the research runtimes take it as an
+    injected `temperature_kwargs_func`. The model list itself lives in
+    runtime/llm_policy.py alongside model selection.
+    """
+    from .runtime.llm_policy import sampling_kwargs
+
+    return sampling_kwargs(model, temperature)
 
 
 def _extract_text(content_blocks) -> str:

@@ -119,6 +119,40 @@ def resolve_lane_llm_selection(
     )
 
 
+# Models that reject non-default sampling parameters (temperature / top_p /
+# top_k) with a 400. Matched as substrings against the resolved model id, so
+# both the bare alias and any dated variant are covered.
+#
+# Anything not listed here still accepts temperature: Haiku 4.5, Sonnet 4.6,
+# Opus 4.6, and older models. Add a marker when adopting a newer model rather
+# than special-casing the call site.
+_NO_SAMPLING_MODEL_MARKERS: tuple[str, ...] = (
+    "opus-4-7",
+    "opus-4-8",
+    "opus-5",
+    "sonnet-5",
+    "fable-5",
+    "mythos-5",
+)
+
+
+def model_rejects_sampling(model: str) -> bool:
+    """True when this model 400s on temperature/top_p/top_k."""
+    normalized = str(model or "").lower()
+    return any(marker in normalized for marker in _NO_SAMPLING_MODEL_MARKERS)
+
+
+def sampling_kwargs(model: str, temperature: float) -> dict:
+    """Return the sampling kwargs to splat into messages.create() for a model.
+
+    Empty for models that reject sampling parameters, so one call site works
+    across model generations without the lane knowing which is which.
+    """
+    if model_rejects_sampling(model):
+        return {}
+    return {"temperature": temperature}
+
+
 def build_provider_client(selection: LLMSelection):
     """Return the provider client for this selection.
 
