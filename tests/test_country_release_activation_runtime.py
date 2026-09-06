@@ -62,6 +62,38 @@ def test_cloud_partition_index_is_read_through_shared_artifact_seam(tmp_path: Pa
     reader.assert_called_once_with(root / "identity_partitions.parquet", columns=["path"])
 
 
+def test_cloud_exact_identity_route_avoids_partition_index_fanout(tmp_path: Path) -> None:
+    root = tmp_path / "geometry/countries/USA/releases/geometry/r/runtime/reference_graph"
+    partition = tmp_path / "geometry/countries/USA/relationships/wbd/identity_versions.parquet"
+    frame = pd.DataFrame({"path": [str(partition.relative_to(tmp_path)).replace("\\", "/")]})
+    with (
+        patch.object(reference_graph, "DATA_ROOT", tmp_path),
+        patch.object(reference_graph, "is_cloud_mode", return_value=True),
+        patch.object(reference_graph, "select_rows", return_value=frame) as reader,
+    ):
+        paths = reference_graph._route_paths(
+            root, reference_graph.IDENTITY_ROUTE_INDEX, "loc_id", ["USA-WBD-HUC12-010100020101"],
+        )
+    assert paths == [partition]
+    reader.assert_called_once_with(
+        root / "identity_routes.parquet",
+        columns=["path"],
+        in_filters={"loc_id": ["USA-WBD-HUC12-010100020101"]},
+    )
+
+
+def test_relationship_route_selects_only_matching_endpoint_family(tmp_path: Path) -> None:
+    root = tmp_path / "graph"
+    root.mkdir()
+    pd.DataFrame([
+        {"source_family": "watershed", "target_family": "admin_2", "path": "wbd_county.parquet"},
+        {"source_family": "protected_area", "target_family": "admin_2", "path": "forest_county.parquet"},
+    ]).to_parquet(root / "relationship_partitions.parquet", index=False)
+    with patch.object(reference_graph, "DATA_ROOT", tmp_path):
+        paths = reference_graph._relationship_route_paths(root, "watershed", "source_family")
+    assert paths == [tmp_path / "wbd_county.parquet"]
+
+
 def test_cloud_reference_family_discovery_is_catalog_owned(tmp_path: Path) -> None:
     root = tmp_path / "geometry/countries/NZL/releases/geometry/r/runtime/reference_graph"
     frame = pd.DataFrame({

@@ -43,6 +43,8 @@ FULL_GRAPH_FILES = (
     "shape_partitions.parquet", "relationship_partitions.parquet",
     "endpoint_families.parquet", "source_manifests.parquet", "manifest.json",
 )
+IDENTITY_ROUTE_INDEX = "identity_routes.parquet"
+ALIAS_SYSTEM_ROUTE_INDEX = "alias_system_routes.parquet"
 
 #: Identity columns read from partitions. Partitions span countries and
 #: families with differing schemas, and some carry a GEOMETRY column DuckDB
@@ -269,6 +271,51 @@ def _partition_paths(root: Path, table: str) -> list[Path]:
     return list(dict.fromkeys(DATA_ROOT / str(value) for value in rows if value))
 
 
+def _route_paths(
+    root: Path, index_name: str, key: str, values: list[str],
+) -> list[Path]:
+    """Resolve optional exact routes without weakening older graph releases."""
+    index_path = root / index_name
+    if not values:
+        return []
+    try:
+        if index_path.is_file():
+            rows = pq.read_table(
+                index_path, columns=["path"], filters=[(key, "in", values)],
+            ).to_pydict().get("path", [])
+        elif is_cloud_mode():
+            frame = select_rows(index_path, columns=["path"], in_filters={key: values})
+            rows = frame["path"].tolist() if "path" in frame.columns else []
+        else:
+            return []
+    except Exception:
+        return []
+    return list(dict.fromkeys(DATA_ROOT / str(value) for value in rows if value))
+
+
+def _relationship_route_paths(
+    root: Path, family: str, endpoint_column: str,
+) -> list[Path]:
+    if endpoint_column not in {"source_family", "target_family"} or not family:
+        return []
+    index_path = root / PARTITION_INDEXES["relationships"]
+    try:
+        if index_path.is_file():
+            rows = pq.read_table(
+                index_path, columns=["path"], filters=[(endpoint_column, "=", family)],
+            ).to_pydict().get("path", [])
+        elif is_cloud_mode():
+            frame = select_rows(
+                index_path, columns=["path"], exact_filters={endpoint_column: family},
+            )
+            rows = frame["path"].tolist() if "path" in frame.columns else []
+        else:
+            return []
+    except Exception:
+        return []
+    return list(dict.fromkeys(DATA_ROOT / str(value) for value in rows if value))
+
+
 def _table_source(table: str, *, loc_id: str | None = None) -> str:
     """Build the DuckDB read_parquet argument spanning the relevant graphs.
 
@@ -283,12 +330,32 @@ def _table_source(table: str, *, loc_id: str | None = None) -> str:
     return _table_source_for_roots(table, roots)
 
 
-def _table_source_for_roots(table: str, roots: list[Path]) -> str:
+def _table_source_for_roots(
+    table: str,
+    roots: list[Path],
+    *,
+    loc_ids: list[str] | None = None,
+    reference_system: str | None = None,
+    relationship_family: str | None = None,
+    relationship_endpoint: str | None = None,
+) -> str:
     paths: list[str] = []
     for root in roots:
+        routed: list[Path] = []
+        if table in {"identities", "identity_versions"} and loc_ids:
+            routed = _route_paths(root, IDENTITY_ROUTE_INDEX, "loc_id", loc_ids)
+        elif table == "aliases" and reference_system:
+            routed = _route_paths(
+                root, ALIAS_SYSTEM_ROUTE_INDEX, "reference_system", [reference_system],
+            )
+        elif table == "relationships" and relationship_family and relationship_endpoint:
+            routed = _relationship_route_paths(
+                root, relationship_family, relationship_endpoint,
+            )
+        selected = routed or _partition_paths(root, table)
         paths.extend(
             _sql_path(path)
-            for path in _partition_paths(root, table)
+            for path in selected
             if is_cloud_mode() or path.is_file()
         )
     if not paths:
@@ -306,10 +373,15 @@ def _identity_columns(loc_id: str | None = None) -> str:
     return _identity_columns_for_roots(roots)
 
 
-def _identity_columns_for_roots(roots: list[Path]) -> str:
+def _identity_columns_for_roots(
+    roots: list[Path], partition_paths: list[Path] | None = None,
+) -> str:
     available: set[str] = set()
-    for root in roots:
-        for path in _partition_paths(root, "identities"):
+    path_groups = [partition_paths] if partition_paths is not None else [
+        _partition_paths(root, "identities") for root in roots
+    ]
+    for paths in path_groups:
+        for path in paths:
             try:
                 available.update(parquet_columns(path))
             except Exception:
@@ -478,11 +550,15 @@ def identity(loc_id: str) -> dict[str, Any] | None:
         # Query roots one at a time so country authority wins deterministically
         # when its Admin0 loc_id is also present in the global fallback.
         for root in graph_roots_for_loc_id(loc_id):
-            source = _table_source_for_roots("identities", [root])
+            partition_paths = (
+                _route_paths(root, IDENTITY_ROUTE_INDEX, "loc_id", [str(loc_id)])
+                or _partition_paths(root, "identities")
+            )
+            source = _table_source_for_roots("identities", [root], loc_ids=[str(loc_id)])
             if not source:
                 continue
             cursor = connection.execute(
-                f"SELECT * FROM (SELECT {_identity_columns_for_roots([root])} "
+                f"SELECT * FROM (SELECT {_identity_columns_for_roots([root], partition_paths)} "
                 f"FROM read_parquet({source}, union_by_name=True)) AS candidates "
                 f"WHERE loc_id = ? ORDER BY {IDENTITY_RECENCY_ORDER} LIMIT 1",
                 [str(loc_id)],
@@ -571,13 +647,17 @@ def identities(loc_ids: list[str]) -> list[dict[str, Any]]:
         for root in roots:
             if not remaining:
                 break
-            source = _table_source_for_roots("identities", [root])
+            partition_paths = (
+                _route_paths(root, IDENTITY_ROUTE_INDEX, "loc_id", remaining)
+                or _partition_paths(root, "identities")
+            )
+            source = _table_source_for_roots("identities", [root], loc_ids=remaining)
             if not source:
                 continue
             placeholders = ", ".join("?" for _ in remaining)
             cursor = connection.execute(
                 f"""WITH candidates AS (
-                        SELECT {_identity_columns_for_roots([root])}
+                        SELECT {_identity_columns_for_roots([root], partition_paths)}
                         FROM read_parquet({source}, union_by_name=True)
                         WHERE loc_id IN ({placeholders})
                     ), ranked AS (
@@ -631,7 +711,9 @@ def resolve_alias(
     global_root = global_reference_graph_root()
     if global_root and not country:
         selected_roots.append(global_root)
-    source = _table_source_for_roots("aliases", selected_roots)
+    source = _table_source_for_roots(
+        "aliases", selected_roots, reference_system=str(reference_system),
+    )
     if not source:
         return []
     connection = _connection()
@@ -801,13 +883,26 @@ def relationships_for_loc_id(
     if not reference_graph_available():
         return []
     direction = str(direction).strip().lower()
-    root = active_reference_graph_root()
+    roots = graph_roots_for_loc_id(loc_id)
+    node = identity(loc_id) or {}
+    implementation_family = str(node.get("family") or "")
+    family = (
+        implementation_family
+        if implementation_family.startswith("admin_")
+        else str(node.get("geography_family") or implementation_family)
+    )
     connection = _connection()
     try:
         requested_limit = max(1, int(limit))
-        path = _table_source("relationships", loc_id=loc_id)
-
         def selected_rows(column: str) -> list[dict[str, Any]]:
+            endpoint = "source_family" if column == "source_loc_id" else "target_family"
+            path = _table_source_for_roots(
+                "relationships", roots,
+                relationship_family=family or None,
+                relationship_endpoint=endpoint,
+            )
+            if not path:
+                return []
             cursor = connection.execute(
                 f"SELECT * FROM read_parquet({path}, union_by_name=True) WHERE {column} = ? LIMIT ?",
                 [str(loc_id), requested_limit],

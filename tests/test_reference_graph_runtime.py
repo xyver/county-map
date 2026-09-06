@@ -240,9 +240,12 @@ class ReferenceGraphRuntimeTests(unittest.TestCase):
             rows = relationships_for_loc_id("TST-A-001")
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(len(statements), 2)
-        self.assertTrue(all("ORDER BY" not in statement.upper() for statement in statements))
-        self.assertTrue(all("LIMIT ?" in statement.upper() for statement in statements))
+        # One exact identity lookup discovers the endpoint family, after which
+        # outgoing and incoming scans open only matching relationship partitions.
+        self.assertEqual(len(statements), 3)
+        relationship_statements = statements[-2:]
+        self.assertTrue(all("ORDER BY" not in statement.upper() for statement in relationship_statements))
+        self.assertTrue(all("LIMIT ?" in statement.upper() for statement in relationship_statements))
 
     def test_existing_reference_tools_use_graph_without_new_contract(self) -> None:
         resolved = resolve_reference(from_system="test.code", value="001", iso3="TST")
