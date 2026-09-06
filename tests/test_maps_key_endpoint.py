@@ -9,12 +9,15 @@ returns to this process.
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import msgpack
 from fastapi.testclient import TestClient
 
 import app as app_module
 from mapmover import logging_analytics, security
+from mapmover.routes import geometry as geometry_routes
 
 
 class MapsKeyRateLimitTests(unittest.TestCase):
@@ -81,6 +84,82 @@ class MapsKeyUsageTrackingTests(unittest.TestCase):
             logging_analytics._should_mirror_route_event_to_control_plane(
                 "/api/config/maps-key", method="GET", status_code=429, rate_limited=True
             )
+        )
+
+
+class AddressSelectionUsageTrackingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        limiter_patch = patch.object(
+            app_module, "rate_limiter", security.SlidingWindowRateLimiter()
+        )
+        limiter_patch.start()
+        self.addCleanup(limiter_patch.stop)
+        self.client = TestClient(app_module.app)
+        self.addCleanup(self.client.close)
+
+    def test_selected_address_is_recorded_without_address_or_coordinates(self) -> None:
+        resolved = {
+            "matched": {"loc_id": "USA-CA-075", "name": "San Francisco", "admin_level": 2},
+            "stack": [],
+        }
+        body = msgpack.packb(
+            {
+                "lon": -122.4194,
+                "lat": 37.7749,
+                "interaction_source": "address_autocomplete",
+            },
+            use_bin_type=True,
+        )
+        with (
+            patch.object(geometry_routes, "resolve_points_to_locations", return_value=[resolved]),
+            patch.object(geometry_routes, "log_api_query_event") as log_event,
+        ):
+            response = self.client.post(
+                "/geometry/resolve-point",
+                content=body,
+                headers={"Content-Type": "application/msgpack"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        fields = log_event.call_args.kwargs
+        self.assertEqual("address_lookup_selection", fields["capability_id"])
+        self.assertEqual("address_autocomplete", fields["source_id"])
+        self.assertEqual("address_lookup_selected", fields["metadata"]["event"])
+        self.assertNotIn("lon", fields["metadata"])
+        self.assertNotIn("lat", fields["metadata"])
+        self.assertNotIn("address", fields["metadata"])
+
+    def test_unknown_interaction_source_cannot_spoof_an_analytics_lane(self) -> None:
+        body = msgpack.packb(
+            {"lon": -122.4194, "lat": 37.7749, "interaction_source": "made_up"},
+            use_bin_type=True,
+        )
+        with (
+            patch.object(
+                geometry_routes,
+                "resolve_points_to_locations",
+                return_value=[{"matched": {"loc_id": "USA-CA-075"}, "stack": []}],
+            ),
+            patch.object(geometry_routes, "log_api_query_event") as log_event,
+        ):
+            response = self.client.post(
+                "/geometry/resolve-point",
+                content=body,
+                headers={"Content-Type": "application/msgpack"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("point_lookup", log_event.call_args.kwargs["source_id"])
+
+
+class AddressCardFrontendContractTests(unittest.TestCase):
+    def test_auth_failure_is_checked_before_ready_status_and_selection_is_tagged(self) -> None:
+        source = (Path(__file__).parents[1] / "static" / "modules" / "chat-panel.js").read_text(encoding="utf-8")
+        self.assertIn("throw new Error('maps_auth_failed')", source)
+        self.assertIn("interaction_source: 'address_autocomplete'", source)
+        self.assertLess(
+            source.index("Loading its boundary..."),
+            source.index("const geojson = await postMsgpack('/geometry/features'"),
         )
 
 

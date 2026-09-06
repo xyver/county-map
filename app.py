@@ -662,14 +662,15 @@ async def maps_key_config(request: Request):
 
     request.state.analytics_metadata = {
         **(getattr(request.state, "analytics_metadata", None) or {}),
-        "tool": "address_autocomplete",
+        "tool": "address_card",
+        "event": "google_maps_key_fetch",
         "config_key": "google_maps",
     }
 
     if not allowed:
         request.state.analytics_error_code = "maps_key_rate_limited"
         return JSONResponse(
-            {"error": "Too many address lookups. Please wait a moment and try again."},
+            {"error": "Too many address-search setup requests. Please wait a moment and try again."},
             status_code=429,
             headers={"Retry-After": str(retry_after)},
         )

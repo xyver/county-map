@@ -399,6 +399,7 @@ async def get_geometry_features_endpoint(req: Request):
 @router.post("/geometry/resolve-point")
 async def resolve_point_endpoint(req: Request):
     """Resolve a lon/lat point to the deepest available containing loc_id."""
+    started_at = time.perf_counter()
     try:
         body = await decode_request_body(req)
         lon = body.get("lon")
@@ -410,6 +411,40 @@ async def resolve_point_endpoint(req: Request):
         country_scope = str(body.get("country_scope") or body.get("country_hint") or "").strip().upper() or None
         results = resolve_points_to_locations([{"lon": lon, "lat": lat}], include_geometry=False, target_admin_level=target_admin_level, country_scope=country_scope)
         result = results[0] if results else {"error": "point did not resolve"}
+        interaction_source = str(body.get("interaction_source") or "point_lookup").strip().lower()
+        if interaction_source not in {"address_autocomplete", "point_lookup"}:
+            interaction_source = "point_lookup"
+        status_code = 404 if result.get("error") else 200
+        caller_identity = request_caller_identity(req)
+        metadata = {
+            **(getattr(req.state, "analytics_metadata", None) or {}),
+            "surface": interaction_source,
+            "event": "address_lookup_selected" if interaction_source == "address_autocomplete" else "point_lookup",
+            "interaction_source": interaction_source,
+            "resolved": not bool(result.get("error")),
+            "target_admin_level": f"admin_{target_admin_level}" if target_admin_level is not None else "deepest",
+            "country_scope": country_scope,
+        }
+        req.state.analytics_metadata = metadata
+        try:
+            log_api_query_event(
+                request_id=str(getattr(req.state, "analytics_request_id", "") or f"point-{int(time.time() * 1000)}"),
+                capability_id="address_lookup_selection" if interaction_source == "address_autocomplete" else "point_lookup",
+                pack_id="geography_tools",
+                source_id=interaction_source,
+                decision="allow" if status_code == 200 else "deny",
+                auth_user_id=caller_identity.auth_user_id,
+                ip_hash=hash_ip_for_analytics(get_client_ip(req)),
+                user_agent=req.headers.get("user-agent", "").strip() or None,
+                execution_latency_ms=int((time.perf_counter() - started_at) * 1000),
+                row_count=1 if status_code == 200 else 0,
+                status_code=status_code,
+                error_code=None if status_code == 200 else "point_not_resolved",
+                query_granularity="single_point",
+                metadata=metadata,
+            )
+        except Exception as analytics_exc:
+            logger.warning(f"Failed to record point lookup analytics: {analytics_exc}")
         if result.get("error"):
             return msgpack_response(result, status_code=404)
         return msgpack_response(result)

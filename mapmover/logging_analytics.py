@@ -166,9 +166,9 @@ _MCP_SCANNER_METHODS = frozenset({
 
 
 # Paths whose successful calls are mirrored to the control plane. Each one
-# either spends money with an outside provider or releases a credential, and
-# each carries its own low rate-limit ceiling, so the volume stays small and the
-# signal is "someone used this", not "the browser polled again".
+# releases a browser credential and carries its own low rate-limit ceiling, so
+# the volume stays small. These events measure that a feature was opened; the
+# product action itself must be recorded separately.
 _METERED_CONFIG_PATHS = frozenset({
     "/api/config/maps-key",
 })

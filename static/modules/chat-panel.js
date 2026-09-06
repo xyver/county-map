@@ -3882,6 +3882,9 @@ export const ChatManager = {
 
     try {
       await this.ensureGoogleMapsPlaces();
+      if (this.googleMapsAuthFailed) {
+        throw new Error('maps_auth_failed');
+      }
       this.attachAddressAutocomplete(input, status, details);
       status.textContent = 'Start typing and choose a suggested address.';
       input.focus();
@@ -3890,6 +3893,10 @@ export const ChatManager = {
       if (error?.message === 'maps_key_rate_limited') {
         const wait = error.retryAfterSeconds || 5;
         status.textContent = `Too many address lookups just now. Try again in ${wait} second${wait === 1 ? '' : 's'}.`;
+      } else if (error?.message === 'maps_auth_failed') {
+        status.textContent =
+          'Address search was rejected by Google. Check the Places quota and '
+          + 'the API key website and API restrictions.';
       } else {
         status.textContent = 'Address autocomplete is not configured yet. Add a Google Maps API key to enable it.';
       }
@@ -3897,6 +3904,9 @@ export const ChatManager = {
   },
 
   async ensureGoogleMapsPlaces() {
+    if (this.googleMapsAuthFailed) {
+      throw new Error('maps_auth_failed');
+    }
     if (window.google?.maps?.places?.Autocomplete) {
       return window.google;
     }
@@ -3957,6 +3967,9 @@ export const ChatManager = {
         document.head.appendChild(script);
       });
 
+      if (this.googleMapsAuthFailed) {
+        throw new Error('maps_auth_failed');
+      }
       if (!window.google?.maps?.places?.Autocomplete) {
         throw new Error('maps_places_unavailable');
       }
@@ -4015,48 +4028,64 @@ export const ChatManager = {
   },
 
   async resolveAddressSelection(parsed, status, details) {
+    let resolution;
     try {
-      const resolution = await postMsgpack('/geometry/resolve-point', {
+      resolution = await postMsgpack('/geometry/resolve-point', {
         lon: parsed.lng,
-        lat: parsed.lat
+        lat: parsed.lat,
+        interaction_source: 'address_autocomplete'
       });
-      this.addressContext = {
-        ...parsed,
-        resolved_loc_id: resolution?.matched?.loc_id || null,
-        resolved_name: resolution?.matched?.name || null,
-        resolved_admin_level: resolution?.matched?.admin_level ?? null,
-        resolution_stack: resolution?.stack || []
-      };
+    } catch (error) {
+      console.error('Address resolution failed:', error);
+      status.textContent = 'Address captured, but the containing loc_id lookup failed.';
+      return;
+    }
 
-      if (!resolution?.matched?.loc_id) {
-        status.textContent = 'Address captured, but I could not match a containing loc_id shape yet.';
-        return;
-      }
+    this.addressContext = {
+      ...parsed,
+      resolved_loc_id: resolution?.matched?.loc_id || null,
+      resolved_name: resolution?.matched?.name || null,
+      resolved_admin_level: resolution?.matched?.admin_level ?? null,
+      resolution_stack: resolution?.stack || []
+    };
 
+    if (!resolution?.matched?.loc_id) {
+      status.textContent = 'Address captured, but I could not match a containing loc_id yet.';
+      return;
+    }
+
+    const matchedLabel = resolution.matched.name || resolution.matched.loc_id;
+    status.textContent = `Address matched to ${matchedLabel} (${resolution.matched.loc_id}). Loading its boundary...`;
+    this.showResolvedAddressOnMap(parsed, {
+      ...resolution,
+      geojson: { type: 'FeatureCollection', features: [] }
+    });
+
+    const matchLines = [
+      `Matched loc_id: ${resolution.matched.loc_id}`,
+      `Matched level: admin_${resolution.matched.admin_level}`,
+    ];
+    for (const line of matchLines) {
+      const row = document.createElement('div');
+      row.className = 'address-prompt-detail-row address-prompt-detail-row--match';
+      row.textContent = line;
+      details.appendChild(row);
+    }
+
+    try {
       const geojson = await postMsgpack('/geometry/features', {
         loc_ids: [resolution.matched.loc_id]
       });
       if (!geojson?.features?.length) {
-        status.textContent = 'Address matched, but its selected map shape is not available yet.';
+        status.textContent = `Address matched to ${matchedLabel} (${resolution.matched.loc_id}); its boundary is not available yet.`;
         return;
       }
 
       this.showResolvedAddressOnMap(parsed, { ...resolution, geojson });
-      status.textContent = `Address matched to ${resolution.matched.name} (${resolution.matched.loc_id}).`;
-
-      const matchLines = [
-        `Matched loc_id: ${resolution.matched.loc_id}`,
-        `Matched level: admin_${resolution.matched.admin_level}`,
-      ];
-      for (const line of matchLines) {
-        const row = document.createElement('div');
-        row.className = 'address-prompt-detail-row address-prompt-detail-row--match';
-        row.textContent = line;
-        details.appendChild(row);
-      }
+      status.textContent = `Address matched to ${matchedLabel} (${resolution.matched.loc_id}).`;
     } catch (error) {
-      console.error('Address resolution failed:', error);
-      status.textContent = 'Address captured, but the loc_id highlight lookup failed.';
+      console.error('Address boundary lookup failed:', error);
+      status.textContent = `Address matched to ${matchedLabel} (${resolution.matched.loc_id}); its boundary highlight failed.`;
     }
   },
 
@@ -4072,7 +4101,9 @@ export const ChatManager = {
       admin_level: matched.admin_level
     };
 
-    App?.displayNavigationLocations(resolution.geojson, [location]);
+    if (resolution.geojson?.features?.length) {
+      App?.displayNavigationLocations(resolution.geojson, [location]);
+    }
     this.placeAddressMarker(parsed.lng, parsed.lat);
 
     const feature = resolution.geojson?.features?.[0];
